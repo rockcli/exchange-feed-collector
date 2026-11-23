@@ -32,6 +32,12 @@ SPREAD_COLOR = "#60A5FA"
 BASIS_COLOR = "#FB923C"
 ALERT_COLOR = "#F43F5E"
 
+VENUE_LABELS = {
+    "coinbase": "Coinbase",
+    "kraken": "Kraken",
+    "okx": "OKX",
+}
+
 
 def _ts_ms_to_dt(ts_ms: int) -> datetime:
     return datetime.fromtimestamp(ts_ms / 1000.0, tz=UTC)
@@ -84,6 +90,11 @@ def _plot_price_series(ax: Axes, analysis: AnalysisResult) -> None:
     ax.set_ylabel("Midpoint Price", color=TEXT_MUTED, fontsize=9.5)
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))  # type: ignore[no-untyped-call]
     ax.ticklabel_format(axis="y", useOffset=False, style="plain")
+    all_y = [float(v) for v in (*cb_y, *kr_y, *okx_y) if v is not None]
+    if all_y:
+        ymin, ymax = min(all_y), max(all_y)
+        pad = max(1.0, ymax - ymin)
+        ax.set_ylim(ymin - 0.10 * pad, ymax + 0.34 * pad)
     ax.legend(
         loc="upper left",
         facecolor=BG_COLOR,
@@ -124,6 +135,18 @@ def _plot_spread_series(ax: Axes, analysis: AnalysisResult) -> None:
         )
 
     ax.axhline(0.0, color=TEXT_MUTED, linewidth=0.9, alpha=0.7)
+    all_bps = [
+        float(v)
+        for v in (
+            *(p[1] for p in usd_pts),
+            *(p[1] for p in usdt_pts),
+        )
+        if v is not None
+    ]
+    if all_bps:
+        bmin, bmax = min(0.0, min(all_bps)), max(0.0, max(all_bps))
+        bpad = max(0.5, bmax - bmin)
+        ax.set_ylim(bmin - 0.10 * bpad, bmax + 0.32 * bpad)
     ax.set_title(
         "Cross-Exchange Spread & USDT/USD Basis (bps)",
         color=TEXT_PRIMARY,
@@ -176,7 +199,8 @@ def _plot_latency_bars(ax: Axes, analysis: AnalysisResult) -> None:
             )
 
     labels = [
-        f"{e.title()}\n(n={int(analysis.latency_by_exchange[e]['count'])})" for e in present
+        f"{VENUE_LABELS.get(e, e.title())}\n(n={int(analysis.latency_by_exchange[e]['count'])})"
+        for e in present
     ]
     ax.set_xticks(x)
     ax.set_xticklabels(labels, color=TEXT_PRIMARY, fontsize=9)
@@ -211,28 +235,35 @@ def _plot_heatmap(ax: Axes, analysis: AnalysisResult) -> None:
         return
 
     exchanges = ["coinbase", "kraken", "okx"]
-    row_labels = ["Coinbase p95 ms", "Kraken p95 ms", "OKX p95 ms", "USD |bps| x10"]
-    matrix = np.zeros((4, len(slices)), dtype=float)
+    row_labels = ["Coinbase p95 ms", "Kraken p95 ms", "OKX p95 ms", "USD Spread |bps|"]
+    raw_matrix = np.zeros((4, len(slices)), dtype=float)
     text_grid: list[list[str]] = [["-" for _ in slices] for _ in range(4)]
 
     for col, sl in enumerate(slices):
         for r_idx, ex in enumerate(exchanges):
             val = sl.p95_latency_by_exchange.get(ex)
             if val is not None:
-                matrix[r_idx, col] = val
+                raw_matrix[r_idx, col] = val
                 text_grid[r_idx][col] = f"{val:.0f}"
         if sl.mean_usd_spread_bps is not None:
-            matrix[3, col] = min(500.0, sl.mean_usd_spread_bps * 10.0)
-            text_grid[3][col] = f"{sl.mean_usd_spread_bps:.1f}"
+            raw_matrix[3, col] = sl.mean_usd_spread_bps
+            text_grid[3][col] = f"{sl.mean_usd_spread_bps:.2f}"
 
-    col_max = float(np.max(matrix)) if np.max(matrix) > 0 else 1.0
-    norm_matrix = matrix / col_max
-    ax.imshow(norm_matrix, aspect="auto", cmap="YlGnBu", vmin=0.0, vmax=1.0)
+    # Normalize latency rows jointly and spread row independently so both remain readable.
+    norm_matrix = np.zeros_like(raw_matrix)
+    lat_max = float(np.max(raw_matrix[:3, :])) if np.max(raw_matrix[:3, :]) > 0 else 1.0
+    spread_max = float(np.max(raw_matrix[3, :])) if np.max(raw_matrix[3, :]) > 0 else 1.0
+    norm_matrix[:3, :] = raw_matrix[:3, :] / lat_max
+    norm_matrix[3, :] = raw_matrix[3, :] / spread_max
+
+    cmap = plt.get_cmap("viridis")
+    ax.imshow(norm_matrix, aspect="auto", cmap=cmap, vmin=0.0, vmax=1.0)
 
     for r_idx in range(4):
         for c_idx in range(len(slices)):
-            val_norm = norm_matrix[r_idx, c_idx]
-            txt_color = "#0B1220" if val_norm > 0.58 else TEXT_PRIMARY
+            rgba = cmap(float(norm_matrix[r_idx, c_idx]))
+            luminance = 0.299 * rgba[0] + 0.587 * rgba[1] + 0.114 * rgba[2]
+            txt_color = "#0B1220" if luminance > 0.56 else TEXT_PRIMARY
             ax.text(
                 c_idx,
                 r_idx,
