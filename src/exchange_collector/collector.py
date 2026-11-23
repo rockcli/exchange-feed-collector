@@ -106,7 +106,6 @@ class FeedCollector:
             )
         )
 
-        proxy_url = resolve_proxy_url()
         internal_stop = asyncio.Event()
 
         async def _timer() -> None:
@@ -118,7 +117,10 @@ class FeedCollector:
             internal_stop.set()
 
         connector = aiohttp.TCPConnector(limit=16, ttl_dns_cache=300)
-        async with aiohttp.ClientSession(connector=connector, trust_env=True) as session:
+        client_timeout = aiohttp.ClientTimeout(total=self.config.http_timeout_seconds)
+        async with aiohttp.ClientSession(
+            connector=connector, timeout=client_timeout, trust_env=True
+        ) as session:
             tasks: list[asyncio.Task[None]] = [
                 asyncio.create_task(_timer(), name="collector-timer"),
                 asyncio.create_task(
@@ -130,13 +132,14 @@ class FeedCollector:
             ]
             for adapter in self.adapters:
                 self.stale_monitor.register_stream(adapter.exchange, adapter.canonical_symbol)
+                adapter_proxy = resolve_proxy_url(adapter.ws_url)
                 tasks.append(
                     asyncio.create_task(
                         self._run_adapter_loop(
                             run_id=run_id,
                             adapter=adapter,
                             session=session,
-                            proxy_url=proxy_url,
+                            proxy_url=adapter_proxy,
                             stop=internal_stop,
                         ),
                         name=f"stream-{adapter.exchange}",

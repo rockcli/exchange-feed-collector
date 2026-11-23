@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import urllib.parse
 import urllib.request
 from abc import ABC, abstractmethod
 from datetime import UTC, datetime
@@ -23,8 +24,12 @@ class ExchangeRateLimitError(RuntimeError):
         super().__init__(f"{exchange} rate limited; retry after {retry_after_seconds:.1f}s")
 
 
-def resolve_proxy_url() -> str | None:
-    """Resolve HTTPS/HTTP proxy from environment or OS proxy settings when configured."""
+def resolve_proxy_url(target_url: str | None = None) -> str | None:
+    """Resolve HTTPS/HTTP proxy from environment or OS settings, respecting localhost bypass."""
+    if target_url:
+        host = urllib.parse.urlparse(target_url).hostname or ""
+        if host in {"127.0.0.1", "localhost", "::1"} or urllib.request.proxy_bypass(host):
+            return None
     for key in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
         value = os.environ.get(key)
         if value:

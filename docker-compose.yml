@@ -1,0 +1,22 @@
+services:
+  collector-demo:
+    build: .
+    command: ["uv", "run", "--no-sync", "exchange-collector", "demo"]
+    volumes:
+      - ./data:/app/data
+      - ./reports:/app/reports
+    env_file:
+      - path: .env
+        required: false
+
+  collector-live:
+    build: .
+    profiles: ["live"]
+    command: ["uv", "run", "--no-sync", "exchange-collector", "live-sample", "--seconds", "50"]
+    volumes:
+      - ./data:/app/data
+      - ./reports:/app/reports
+      - ./assets:/app/assets
+    env_file:
+      - path: .env
+        required: false
