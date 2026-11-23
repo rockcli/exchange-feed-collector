@@ -1,6 +1,6 @@
 .PHONY: demo live-sample soak test lint typecheck clean
 
-SAMPLE_SECONDS ?= 50
+SAMPLE_SECONDS ?= 45
 SOAK_HOURS ?= 72
 
 demo:

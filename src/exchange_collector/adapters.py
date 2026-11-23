@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import urllib.parse
 import urllib.request
@@ -93,6 +94,12 @@ def _to_optional_int(value: Any) -> int | None:
     return int(value)
 
 
+def _payload_digest(*parts: object) -> str:
+    """Compute a compact deterministic digest for ticker updates lacking a sequence ID."""
+    joined = "|".join("" if p is None else str(p) for p in parts)
+    return hashlib.blake2b(joined.encode("utf-8"), digest_size=8).hexdigest()
+
+
 def build_tick(
     *,
     exchange: str,
@@ -106,6 +113,7 @@ def build_tick(
     ts_ms: int,
     received_ms: int,
     source: str,
+    dedup_seq: str | None = None,
 ) -> NormalizedTick:
     """Construct a normalized tick with canonical symbol and ingest latency."""
     symbol, base, quote = normalize_symbol(exchange, raw_symbol)
@@ -126,6 +134,7 @@ def build_tick(
         received_ms=received_ms,
         latency_ms=float(received_ms - ts_ms),
         source=source,
+        dedup_seq=dedup_seq,
     )
 
 
@@ -228,20 +237,37 @@ class CoinbaseAdapter(ExchangeAdapter):
             return []
         raw_time = payload.get("time")
         ts_ms = parse_iso_to_ms(str(raw_time)) if raw_time else received_ms
-        seq = _to_optional_int(payload.get("trade_id")) or _to_optional_int(payload.get("sequence"))
+        raw_sym = str(payload.get("product_id", self.raw_symbol))
+        price = float(payload["price"])
+        bid = _to_optional_float(payload.get("best_bid"))
+        ask = _to_optional_float(payload.get("best_ask"))
+        size = _to_optional_float(payload.get("last_size"))
+        vol = _to_optional_float(payload.get("volume_24h"))
+        trade_id = _to_optional_int(payload.get("trade_id"))
+        feed_seq = _to_optional_int(payload.get("sequence"))
+        dedup_seq = (
+            f"seq:{feed_seq}"
+            if feed_seq is not None
+            else (
+                f"tid:{trade_id}"
+                if trade_id is not None
+                else _payload_digest(self.exchange, raw_sym, ts_ms, price, bid, ask, size, vol)
+            )
+        )
         return [
             build_tick(
                 exchange=self.exchange,
-                raw_symbol=str(payload.get("product_id", self.raw_symbol)),
-                price=float(payload["price"]),
-                bid=_to_optional_float(payload.get("best_bid")),
-                ask=_to_optional_float(payload.get("best_ask")),
-                size=_to_optional_float(payload.get("last_size")),
-                volume_24h=_to_optional_float(payload.get("volume_24h")),
-                sequence_id=seq,
+                raw_symbol=raw_sym,
+                price=price,
+                bid=bid,
+                ask=ask,
+                size=size,
+                volume_24h=vol,
+                sequence_id=trade_id,
                 ts_ms=ts_ms,
                 received_ms=received_ms,
                 source="ws",
+                dedup_seq=dedup_seq,
             )
         ]
 
@@ -256,18 +282,30 @@ class CoinbaseAdapter(ExchangeAdapter):
         if not isinstance(data, dict) or "price" not in data:
             return None
         ts_ms = parse_iso_to_ms(str(data["time"])) if data.get("time") else received_ms
+        price = float(data["price"])
+        bid = _to_optional_float(data.get("bid"))
+        ask = _to_optional_float(data.get("ask"))
+        size = _to_optional_float(data.get("size"))
+        vol = _to_optional_float(data.get("volume"))
+        trade_id = _to_optional_int(data.get("trade_id"))
+        dedup_seq = (
+            f"tid:{trade_id}"
+            if trade_id is not None
+            else _payload_digest(self.exchange, self.raw_symbol, ts_ms, price, bid, ask, size, vol)
+        )
         return build_tick(
             exchange=self.exchange,
             raw_symbol=self.raw_symbol,
-            price=float(data["price"]),
-            bid=_to_optional_float(data.get("bid")),
-            ask=_to_optional_float(data.get("ask")),
-            size=_to_optional_float(data.get("size")),
-            volume_24h=_to_optional_float(data.get("volume")),
-            sequence_id=_to_optional_int(data.get("trade_id")),
+            price=price,
+            bid=bid,
+            ask=ask,
+            size=size,
+            volume_24h=vol,
+            sequence_id=trade_id,
             ts_ms=ts_ms,
             received_ms=received_ms,
             source="rest_poll",
+            dedup_seq=dedup_seq,
         )
 
     async def fetch_rest_backfill(
@@ -289,19 +327,30 @@ class CoinbaseAdapter(ExchangeAdapter):
             ts_ms = parse_iso_to_ms(str(item["time"]))
             if ts_ms < start_ts_ms or ts_ms > end_ts_ms:
                 continue
+            price = float(item["price"])
+            size = _to_optional_float(item.get("size"))
+            trade_id = _to_optional_int(item.get("trade_id"))
+            dedup_seq = (
+                str(trade_id)
+                if trade_id is not None
+                else _payload_digest(
+                    self.exchange, self.raw_symbol, ts_ms, price, size, item.get("side")
+                )
+            )
             ticks.append(
                 build_tick(
                     exchange=self.exchange,
                     raw_symbol=self.raw_symbol,
-                    price=float(item["price"]),
+                    price=price,
                     bid=None,
                     ask=None,
-                    size=_to_optional_float(item.get("size")),
+                    size=size,
                     volume_24h=None,
-                    sequence_id=_to_optional_int(item.get("trade_id")),
+                    sequence_id=trade_id,
                     ts_ms=ts_ms,
                     received_ms=received_ms,
                     source="rest_backfill",
+                    dedup_seq=dedup_seq,
                 )
             )
         ticks.sort(key=lambda t: t.ts_ms)
@@ -348,19 +397,31 @@ class KrakenAdapter(ExchangeAdapter):
                 continue
             raw_ts = item.get("timestamp")
             ts_ms = parse_iso_to_ms(str(raw_ts)) if raw_ts else received_ms
+            raw_sym = str(item.get("symbol", self.raw_symbol))
+            price = float(item["last"])
+            bid = _to_optional_float(item.get("bid"))
+            ask = _to_optional_float(item.get("ask"))
+            vol = _to_optional_float(item.get("volume"))
+            trade_id = _to_optional_int(item.get("trade_id"))
+            dedup_seq = (
+                str(trade_id)
+                if trade_id is not None
+                else _payload_digest(self.exchange, raw_sym, ts_ms, price, bid, ask, vol)
+            )
             ticks.append(
                 build_tick(
                     exchange=self.exchange,
-                    raw_symbol=str(item.get("symbol", self.raw_symbol)),
-                    price=float(item["last"]),
-                    bid=_to_optional_float(item.get("bid")),
-                    ask=_to_optional_float(item.get("ask")),
+                    raw_symbol=raw_sym,
+                    price=price,
+                    bid=bid,
+                    ask=ask,
                     size=None,
-                    volume_24h=_to_optional_float(item.get("volume")),
-                    sequence_id=None,
+                    volume_24h=vol,
+                    sequence_id=trade_id,
                     ts_ms=ts_ms,
                     received_ms=received_ms,
                     source="ws",
+                    dedup_seq=dedup_seq,
                 )
             )
         return ticks
@@ -385,18 +446,27 @@ class KrakenAdapter(ExchangeAdapter):
         vol_list = ticker.get("v") or []
         if not close_list:
             return None
+        price = float(close_list[0])
+        bid = _to_optional_float(bid_list[0]) if bid_list else None
+        ask = _to_optional_float(ask_list[0]) if ask_list else None
+        size = _to_optional_float(close_list[1]) if len(close_list) > 1 else None
+        vol = _to_optional_float(vol_list[1]) if len(vol_list) > 1 else None
+        dedup_seq = _payload_digest(
+            self.exchange, raw_pair, received_ms, price, bid, ask, size, vol
+        )
         return build_tick(
             exchange=self.exchange,
             raw_symbol=str(raw_pair),
-            price=float(close_list[0]),
-            bid=_to_optional_float(bid_list[0]) if bid_list else None,
-            ask=_to_optional_float(ask_list[0]) if ask_list else None,
-            size=_to_optional_float(close_list[1]) if len(close_list) > 1 else None,
-            volume_24h=_to_optional_float(vol_list[1]) if len(vol_list) > 1 else None,
+            price=price,
+            bid=bid,
+            ask=ask,
+            size=size,
+            volume_24h=vol,
             sequence_id=None,
             ts_ms=received_ms,
             received_ms=received_ms,
             source="rest_poll",
+            dedup_seq=dedup_seq,
         )
 
     async def fetch_rest_backfill(
@@ -423,19 +493,34 @@ class KrakenAdapter(ExchangeAdapter):
                 if ts_ms < start_ts_ms or ts_ms > end_ts_ms:
                     continue
                 seq = _to_optional_int(entry[6]) if len(entry) > 6 else None
+                price = float(entry[0])
+                size = _to_optional_float(entry[1])
+                dedup_seq = (
+                    str(seq)
+                    if seq is not None
+                    else _payload_digest(
+                        self.exchange,
+                        raw_pair,
+                        ts_ms,
+                        price,
+                        size,
+                        entry[3] if len(entry) > 3 else None,
+                    )
+                )
                 ticks.append(
                     build_tick(
                         exchange=self.exchange,
                         raw_symbol=str(raw_pair),
-                        price=float(entry[0]),
+                        price=price,
                         bid=None,
                         ask=None,
-                        size=_to_optional_float(entry[1]),
+                        size=size,
                         volume_24h=None,
                         sequence_id=seq,
                         ts_ms=ts_ms,
                         received_ms=received_ms,
                         source="rest_backfill",
+                        dedup_seq=dedup_seq,
                     )
                 )
         ticks.sort(key=lambda t: t.ts_ms)
@@ -478,19 +563,32 @@ class OKXAdapter(ExchangeAdapter):
             if not isinstance(item, dict) or "last" not in item:
                 continue
             ts_ms = int(item["ts"]) if item.get("ts") else received_ms
+            raw_sym = str(item.get("instId", self.raw_symbol))
+            price = float(item["last"])
+            bid = _to_optional_float(item.get("bidPx"))
+            ask = _to_optional_float(item.get("askPx"))
+            size = _to_optional_float(item.get("lastSz"))
+            vol = _to_optional_float(item.get("vol24h"))
+            seq_id = _to_optional_int(item.get("seqId"))
+            dedup_seq = (
+                str(seq_id)
+                if seq_id is not None
+                else _payload_digest(self.exchange, raw_sym, ts_ms, price, bid, ask, size, vol)
+            )
             ticks.append(
                 build_tick(
                     exchange=self.exchange,
-                    raw_symbol=str(item.get("instId", self.raw_symbol)),
-                    price=float(item["last"]),
-                    bid=_to_optional_float(item.get("bidPx")),
-                    ask=_to_optional_float(item.get("askPx")),
-                    size=_to_optional_float(item.get("lastSz")),
-                    volume_24h=_to_optional_float(item.get("vol24h")),
-                    sequence_id=None,
+                    raw_symbol=raw_sym,
+                    price=price,
+                    bid=bid,
+                    ask=ask,
+                    size=size,
+                    volume_24h=vol,
+                    sequence_id=seq_id,
                     ts_ms=ts_ms,
                     received_ms=received_ms,
                     source="ws",
+                    dedup_seq=dedup_seq,
                 )
             )
         return ticks
@@ -510,18 +608,31 @@ class OKXAdapter(ExchangeAdapter):
         if not isinstance(item, dict) or "last" not in item:
             return None
         ts_ms = int(item["ts"]) if item.get("ts") else received_ms
+        raw_sym = str(item.get("instId", self.raw_symbol))
+        price = float(item["last"])
+        bid = _to_optional_float(item.get("bidPx"))
+        ask = _to_optional_float(item.get("askPx"))
+        size = _to_optional_float(item.get("lastSz"))
+        vol = _to_optional_float(item.get("vol24h"))
+        seq_id = _to_optional_int(item.get("seqId"))
+        dedup_seq = (
+            str(seq_id)
+            if seq_id is not None
+            else _payload_digest(self.exchange, raw_sym, ts_ms, price, bid, ask, size, vol)
+        )
         return build_tick(
             exchange=self.exchange,
-            raw_symbol=str(item.get("instId", self.raw_symbol)),
-            price=float(item["last"]),
-            bid=_to_optional_float(item.get("bidPx")),
-            ask=_to_optional_float(item.get("askPx")),
-            size=_to_optional_float(item.get("lastSz")),
-            volume_24h=_to_optional_float(item.get("vol24h")),
-            sequence_id=None,
+            raw_symbol=raw_sym,
+            price=price,
+            bid=bid,
+            ask=ask,
+            size=size,
+            volume_24h=vol,
+            sequence_id=seq_id,
             ts_ms=ts_ms,
             received_ms=received_ms,
             source="rest_poll",
+            dedup_seq=dedup_seq,
         )
 
     async def fetch_rest_backfill(
@@ -544,19 +655,31 @@ class OKXAdapter(ExchangeAdapter):
             ts_ms = int(item["ts"])
             if ts_ms < start_ts_ms or ts_ms > end_ts_ms:
                 continue
+            raw_sym = str(item.get("instId", self.raw_symbol))
+            price = float(item["px"])
+            size = _to_optional_float(item.get("sz"))
+            trade_id = _to_optional_int(item.get("tradeId"))
+            dedup_seq = (
+                str(trade_id)
+                if trade_id is not None
+                else _payload_digest(
+                    self.exchange, raw_sym, ts_ms, price, size, item.get("side")
+                )
+            )
             ticks.append(
                 build_tick(
                     exchange=self.exchange,
-                    raw_symbol=str(item.get("instId", self.raw_symbol)),
-                    price=float(item["px"]),
+                    raw_symbol=raw_sym,
+                    price=price,
                     bid=None,
                     ask=None,
-                    size=_to_optional_float(item.get("sz")),
+                    size=size,
                     volume_24h=None,
-                    sequence_id=_to_optional_int(item.get("tradeId")),
+                    sequence_id=trade_id,
                     ts_ms=ts_ms,
                     received_ms=received_ms,
                     source="rest_backfill",
+                    dedup_seq=dedup_seq,
                 )
             )
         ticks.sort(key=lambda t: t.ts_ms)

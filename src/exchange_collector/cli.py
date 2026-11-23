@@ -48,6 +48,16 @@ def _configure_logging(level_name: str) -> None:
     )
 
 
+def _env_db_default(fallback: str) -> Path:
+    val = os.environ.get("EFC_DB_PATH", "").strip()
+    return Path(val) if val else Path(fallback)
+
+
+def _env_report_dir_default() -> Path:
+    val = os.environ.get("EFC_REPORT_DIR", "").strip()
+    return Path(val) if val else Path("reports")
+
+
 def _load_fixture_ticks(
     fixture_path: Path,
 ) -> tuple[str, list[NormalizedTick], list[NormalizedTick]]:
@@ -101,7 +111,7 @@ def run_demo(
     started_ms = min(t.ts_ms for t in stream_ticks)
     ended_ms = max(t.ts_ms for t in stream_ticks)
 
-    gap_detector = GapDetector(gap_threshold_ms=5000, sequence_jump_threshold=50)
+    gap_detector = GapDetector(gap_threshold_ms=5000, sequence_jump_threshold=500)
     stale_monitor = StaleFeedMonitor(stale_seconds=8.0, skew_tolerance_ms=100)
 
     with MarketStorage(db_path) as storage:
@@ -119,10 +129,10 @@ def run_demo(
         )
 
         # Replay sequentially so gap detection, clock-skew alerts, and deduplication all execute.
-        raw_ingested = 0
+        total_inserted = 0
+        total_dups = 0
         mono_base = 1000.0
         for tick in stream_ticks:
-            raw_ingested += 1
             mono_now = mono_base + (tick.ts_ms - started_ms) / 1000.0
             skew = stale_monitor.record_activity(
                 tick.exchange, tick.symbol, tick.ts_ms, tick.received_ms, now_monotonic=mono_now
@@ -156,7 +166,15 @@ def run_demo(
                     if b.exchange == gap.exchange
                     and gap.start_ts_ms <= b.ts_ms <= gap.end_ts_ms
                 ]
-                inserted_bf = storage.upsert_ticks(run_id, matched)
+                inserted_bf, dup_bf = storage.insert_ticks(run_id, matched)
+                total_inserted += inserted_bf
+                total_dups += dup_bf
+                if not matched:
+                    bf_status = "no_overlap"
+                elif inserted_bf > 0:
+                    bf_status = "recovered"
+                else:
+                    bf_status = "unrecovered"
                 storage.insert_gap(
                     GapRecord(
                         run_id=run_id,
@@ -168,18 +186,45 @@ def run_demo(
                         duration_ms=gap.duration_ms,
                         prev_seq=gap.prev_seq,
                         curr_seq=gap.curr_seq,
-                        backfill_status="recovered" if inserted_bf > 0 else "partial",
+                        backfill_status=bf_status,
                         backfilled_rows=inserted_bf,
                         detected_at_utc=tick.ts_utc,
                     )
                 )
 
-            storage.upsert_ticks(run_id, [tick])
+            ins, dup = storage.insert_ticks(run_id, [tick])
+            total_inserted += ins
+            total_dups += dup
 
+        storage.finish_run(
+            run_id,
+            ended_ms,
+            epoch_ms_to_utc_iso(ended_ms),
+            raw_input_rows=total_inserted + total_dups,
+            deduplicated_rows=total_dups,
+        )
         analysis = analyze_run(storage, run_id, bucket_ms=1000, persist_spread_alerts=True)
 
+    return _emit_reports(
+        analysis,
+        report_dir=report_dir,
+        write_assets=write_assets,
+        assets_dir=assets_dir,
+    )
+
+
+def _emit_reports(
+    analysis: AnalysisResult,
+    *,
+    report_dir: Path,
+    write_assets: bool,
+    assets_dir: Path,
+) -> dict[str, Any]:
+    run_id = analysis.run.run_id
+    report_dir.mkdir(parents=True, exist_ok=True)
     overview_path = report_dir / f"{run_id}_overview.png"
     html_path = report_dir / f"{run_id}_report.html"
+    summary_json_path = report_dir / f"{run_id}_summary.json"
     render_overview_chart(analysis, overview_path)
     render_html_report(analysis, overview_path, html_path)
 
@@ -187,9 +232,13 @@ def run_demo(
         render_overview_chart(analysis, assets_dir / "demo_overview.png")
         render_cover_1600x1200(analysis, assets_dir / "cover_1600x1200.png")
 
-    summary = _analysis_to_dict(analysis, html_path=html_path, overview_path=overview_path)
-    summary["raw_input_rows"] = raw_ingested + len(backfill_ticks)
-    summary["deduplicated_rows"] = summary["raw_input_rows"] - analysis.total_ticks
+    summary = _analysis_to_dict(
+        analysis,
+        html_path=html_path,
+        overview_path=overview_path,
+        summary_json_path=summary_json_path,
+    )
+    summary_json_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     return summary
 
 
@@ -215,6 +264,7 @@ async def _run_live_async(
     cfg = CollectorConfig(
         stale_seconds=float(os.environ.get("EFC_STALE_SECONDS", "8.0")),
         gap_threshold_ms=int(os.environ.get("EFC_GAP_THRESHOLD_MS", "5000")),
+        sequence_jump_threshold=int(os.environ.get("EFC_SEQUENCE_JUMP_THRESHOLD", "500")),
         http_timeout_seconds=float(os.environ.get("EFC_HTTP_TIMEOUT_SECONDS", "8.0")),
     )
     bucket_ms = int(os.environ.get("EFC_BUCKET_MS", "1000"))
@@ -231,16 +281,12 @@ async def _run_live_async(
             storage, run_id, bucket_ms=bucket_ms, persist_spread_alerts=True
         )
 
-    overview_path = report_dir / f"{run_id}_overview.png"
-    html_path = report_dir / f"{run_id}_report.html"
-    render_overview_chart(analysis, overview_path)
-    render_html_report(analysis, overview_path, html_path)
-
-    if write_assets:
-        render_overview_chart(analysis, assets_dir / "demo_overview.png")
-        render_cover_1600x1200(analysis, assets_dir / "cover_1600x1200.png")
-
-    return _analysis_to_dict(analysis, html_path=html_path, overview_path=overview_path)
+    return _emit_reports(
+        analysis,
+        report_dir=report_dir,
+        write_assets=write_assets,
+        assets_dir=assets_dir,
+    )
 
 
 def run_report_command(
@@ -252,21 +298,19 @@ def run_report_command(
     write_assets: bool,
     assets_dir: Path,
 ) -> dict[str, Any]:
-    """Generate HTML and PNG reports from an existing SQLite capture run."""
+    """Generate HTML, PNG, and JSON reports from an existing SQLite capture run."""
     with MarketStorage(db_path) as storage:
         target_id = run_id if run_id is not None else storage.latest_run_id()
         if target_id is None:
             raise SystemExit(f"No capture runs found in {db_path}")
         analysis = analyze_run(storage, target_id, bucket_ms=bucket_ms, persist_spread_alerts=False)
 
-    overview_path = report_dir / f"{target_id}_overview.png"
-    html_path = report_dir / f"{target_id}_report.html"
-    render_overview_chart(analysis, overview_path)
-    render_html_report(analysis, overview_path, html_path)
-    if write_assets:
-        render_overview_chart(analysis, assets_dir / "demo_overview.png")
-        render_cover_1600x1200(analysis, assets_dir / "cover_1600x1200.png")
-    return _analysis_to_dict(analysis, html_path=html_path, overview_path=overview_path)
+    return _emit_reports(
+        analysis,
+        report_dir=report_dir,
+        write_assets=write_assets,
+        assets_dir=assets_dir,
+    )
 
 
 def _analysis_to_dict(
@@ -274,15 +318,27 @@ def _analysis_to_dict(
     *,
     html_path: Path,
     overview_path: Path,
+    summary_json_path: Path,
 ) -> dict[str, Any]:
     usd = analysis.usd_spread_summary
     usdt = analysis.usdt_basis_summary
+    raw_input_rows = (
+        analysis.run.raw_input_rows if analysis.run.raw_input_rows > 0 else analysis.total_ticks
+    )
+    deduplicated_rows = analysis.run.deduplicated_rows
+    clock_skew_rows = sum(
+        int(metrics.get("skewed_count", 0.0))
+        for metrics in analysis.latency_by_exchange.values()
+    )
     return {
         "run_id": analysis.run.run_id,
         "mode": analysis.run.mode,
         "started_utc": analysis.run.started_utc,
         "ended_utc": analysis.run.ended_utc,
         "total_ticks": analysis.total_ticks,
+        "raw_input_rows": raw_input_rows,
+        "deduplicated_rows": deduplicated_rows,
+        "clock_skew_rows": clock_skew_rows,
         "exchange_counts": analysis.exchange_counts,
         "latency_ms": analysis.latency_by_exchange,
         "usd_spread": (
@@ -290,6 +346,7 @@ def _analysis_to_dict(
                 "overlapping_buckets": usd.overlapping_buckets,
                 "mean_delta_usd": usd.mean_delta,
                 "mean_abs_bps": usd.mean_abs_bps,
+                "mean_signed_bps": usd.mean_signed_bps,
                 "p95_abs_bps": usd.p95_abs_bps,
                 "max_abs_bps": usd.max_abs_bps,
                 "min_delta_usd": usd.min_delta,
@@ -303,6 +360,7 @@ def _analysis_to_dict(
                 "overlapping_buckets": usdt.overlapping_buckets,
                 "mean_delta": usdt.mean_delta,
                 "mean_abs_bps": usdt.mean_abs_bps,
+                "mean_signed_bps": usdt.mean_signed_bps,
                 "p95_abs_bps": usdt.p95_abs_bps,
                 "max_abs_bps": usdt.max_abs_bps,
                 "min_delta": usdt.min_delta,
@@ -312,9 +370,21 @@ def _analysis_to_dict(
             else None
         ),
         "gaps_detected": len(analysis.gaps),
+        "gaps": [
+            {
+                "exchange": g.exchange,
+                "symbol": g.symbol,
+                "gap_type": g.gap_type,
+                "duration_ms": g.duration_ms,
+                "backfill_status": g.backfill_status,
+                "backfilled_rows": g.backfilled_rows,
+            }
+            for g in analysis.gaps
+        ],
         "alerts_emitted": len(analysis.alerts),
         "report_html": str(html_path),
         "overview_png": str(overview_path),
+        "summary_json": str(summary_json_path),
     }
 
 
@@ -331,30 +401,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
+    default_report_dir = _env_report_dir_default()
+    default_bucket_ms = int(os.environ.get("EFC_BUCKET_MS", "1000"))
+
     p_demo = sub.add_parser("demo", help="Run deterministic offline fixture replay")
     p_demo.add_argument("--fixture", type=Path, default=_default_fixture_path())
-    p_demo.add_argument("--db", type=Path, default=Path("data/demo.db"))
-    p_demo.add_argument("--report-dir", type=Path, default=Path("reports"))
+    p_demo.add_argument("--db", type=Path, default=_env_db_default("data/demo.db"))
+    p_demo.add_argument("--report-dir", type=Path, default=default_report_dir)
     p_demo.add_argument("--write-assets", action="store_true")
     p_demo.add_argument("--assets-dir", type=Path, default=Path("assets"))
 
     p_live = sub.add_parser("live-sample", help="Capture a short live public exchange sample")
     p_live.add_argument("--seconds", type=float, default=50.0)
-    p_live.add_argument("--db", type=Path, default=Path("data/live_sample.db"))
-    p_live.add_argument("--report-dir", type=Path, default=Path("reports"))
+    p_live.add_argument("--db", type=Path, default=_env_db_default("data/live_sample.db"))
+    p_live.add_argument("--report-dir", type=Path, default=default_report_dir)
     p_live.add_argument("--write-assets", action="store_true")
     p_live.add_argument("--assets-dir", type=Path, default=Path("assets"))
 
     p_soak = sub.add_parser("soak", help="Run continuous multi-hour capture with signal flush")
     p_soak.add_argument("--hours", type=float, default=72.0)
-    p_soak.add_argument("--db", type=Path, default=Path("data/soak.db"))
-    p_soak.add_argument("--report-dir", type=Path, default=Path("reports"))
+    p_soak.add_argument("--db", type=Path, default=_env_db_default("data/soak.db"))
+    p_soak.add_argument("--report-dir", type=Path, default=default_report_dir)
 
-    p_rep = sub.add_parser("report", help="Render HTML/PNG report from existing SQLite DB")
-    p_rep.add_argument("--db", type=Path, default=Path("data/live_sample.db"))
+    p_rep = sub.add_parser("report", help="Render HTML/PNG/JSON report from existing SQLite DB")
+    p_rep.add_argument("--db", type=Path, default=_env_db_default("data/live_sample.db"))
     p_rep.add_argument("--run-id", type=str, default=None)
-    p_rep.add_argument("--bucket-ms", type=int, default=1000)
-    p_rep.add_argument("--report-dir", type=Path, default=Path("reports"))
+    p_rep.add_argument("--bucket-ms", type=int, default=default_bucket_ms)
+    p_rep.add_argument("--report-dir", type=Path, default=default_report_dir)
     p_rep.add_argument("--write-assets", action="store_true")
     p_rep.add_argument("--assets-dir", type=Path, default=Path("assets"))
 

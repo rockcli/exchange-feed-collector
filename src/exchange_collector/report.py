@@ -198,16 +198,23 @@ def _plot_latency_bars(ax: Axes, analysis: AnalysisResult) -> None:
                 fontsize=8,
             )
 
-    labels = [
-        f"{VENUE_LABELS.get(e, e.title())}\n(n={int(analysis.latency_by_exchange[e]['count'])})"
-        for e in present
-    ]
+    labels: list[str] = []
+    for e in present:
+        m = analysis.latency_by_exchange[e]
+        non_skewed = int(m.get("non_skewed_count", m["count"]))
+        raw_cnt = int(m.get("raw_count", m["count"]))
+        skewed = int(m.get("skewed_count", 0.0))
+        venue = VENUE_LABELS.get(e, e.title())
+        if skewed > 0:
+            labels.append(f"{venue}\n(n={non_skewed}/{raw_cnt}, skew={skewed})")
+        else:
+            labels.append(f"{venue}\n(n={non_skewed})")
     ax.set_xticks(x)
-    ax.set_xticklabels(labels, color=TEXT_PRIMARY, fontsize=9)
+    ax.set_xticklabels(labels, color=TEXT_PRIMARY, fontsize=8.5)
     max_y = max(max_vals) if max_vals else 10.0
     ax.set_ylim(0, max(10.0, max_y * 1.18))
     ax.set_title(
-        "Ingest Latency Percentiles by Exchange (Live Stream)",
+        "Ingest Latency Percentiles (Non-Skewed Samples >= 0 ms)",
         color=TEXT_PRIMARY,
         fontsize=11.5,
         fontweight="bold",
@@ -469,7 +476,7 @@ def render_cover_1600x1200(analysis: AnalysisResult, out_path: Path) -> Path:
         0.045,
         0.028,
         (
-            "Stack: Python asyncio + aiohttp  ·  SQLite WAL idempotent upsert  ·  "
+            "Stack: Python asyncio + aiohttp  ·  SQLite WAL INSERT OR IGNORE dedup  ·  "
             "Exponential backoff + circuit breaker  ·  REST gap backfill  ·  "
             "Explicit USD vs USDT quote normalization"
         ),
@@ -503,15 +510,20 @@ def render_html_report(
         total_ex = sum(sources.values())
         source_desc = ", ".join(f"{k}: {v}" for k, v in sorted(sources.items()))
         lat = analysis.latency_by_exchange.get(ex, {})
+        non_skewed = int(lat.get("non_skewed_count", lat.get("count", 0.0)))
+        raw_cnt = int(lat.get("raw_count", lat.get("count", 0.0)))
+        skewed = int(lat.get("skewed_count", 0.0))
+        skew_cell = f"{skewed} (min {lat.get('raw_min', 0.0):.1f} ms)" if skewed > 0 else "0"
         venue_rows.append(
             "<tr>"
             f"<td>{html.escape(ex)}</td>"
             f"<td>{total_ex}</td>"
             f"<td>{html.escape(source_desc)}</td>"
+            f"<td>{non_skewed} / {raw_cnt}</td>"
             f"<td>{lat.get('p50', 0.0):.2f} ms</td>"
             f"<td>{lat.get('p95', 0.0):.2f} ms</td>"
             f"<td>{lat.get('max', 0.0):.2f} ms</td>"
-            f"<td>{int(lat.get('skewed_count', 0.0))}</td>"
+            f"<td>{html.escape(skew_cell)}</td>"
             "</tr>"
         )
 
@@ -547,14 +559,15 @@ def render_html_report(
     usd_s = analysis.usd_spread_summary
     usdt_s = analysis.usdt_basis_summary
     usd_summary_html = (
-        f"{usd_s.mean_abs_bps:.2f} bps mean | {usd_s.p95_abs_bps:.2f} bps p95 | "
+        f"{usd_s.mean_abs_bps:.2f} bps abs mean ({usd_s.mean_signed_bps:+.2f} signed) | "
+        f"{usd_s.p95_abs_bps:.2f} bps p95 | "
         f"{usd_s.max_abs_bps:.2f} bps max ({usd_s.overlapping_buckets} buckets)"
         if usd_s
         else "No overlapping USD buckets"
     )
     usdt_summary_html = (
         f"{usdt_s.mean_delta:+.2f} mean (${usdt_s.min_delta:+.2f} to ${usdt_s.max_delta:+.2f}, "
-        f"{usdt_s.mean_abs_bps:.2f} bps mean abs)"
+        f"{usdt_s.mean_abs_bps:.2f} bps abs / {usdt_s.mean_signed_bps:+.2f} signed)"
         if usdt_s
         else "No overlapping USDT/USD buckets"
     )
@@ -629,8 +642,9 @@ def render_html_report(
   <table>
     <thead>
       <tr>
-        <th>Exchange</th><th>Ticks</th><th>Sources</th>
-        <th>p50</th><th>p95</th><th>Max</th><th>Clock Skew Rows</th>
+        <th>Exchange</th><th>Ticks</th><th>Sources</th><th>Non-Skewed Samples</th>
+        <th>p50 (&ge;0 ms)</th><th>p95 (&ge;0 ms)</th><th>Max (&ge;0 ms)</th>
+        <th>Clock Skew (&lt;0 ms)</th>
       </tr>
     </thead>
     <tbody>{''.join(venue_rows)}</tbody>

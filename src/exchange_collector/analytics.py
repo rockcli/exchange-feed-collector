@@ -49,6 +49,7 @@ class SpreadSummary:
     overlapping_buckets: int
     mean_delta: float
     mean_abs_bps: float
+    mean_signed_bps: float
     p95_abs_bps: float
     max_abs_bps: float
     min_delta: float
@@ -144,6 +145,7 @@ def summarize_spreads(
     """Compute descriptive summary metrics for `usd` spread or `usdt_basis`."""
     deltas: list[float] = []
     abs_bps_vals: list[float] = []
+    signed_bps_vals: list[float] = []
     for b in buckets:
         if kind == "usd":
             delta, bps = b.usd_spread_delta, b.usd_spread_bps
@@ -154,6 +156,7 @@ def summarize_spreads(
         if delta is not None and bps is not None:
             deltas.append(delta)
             abs_bps_vals.append(abs(bps))
+            signed_bps_vals.append(bps)
 
     if not deltas:
         return None
@@ -162,6 +165,7 @@ def summarize_spreads(
         overlapping_buckets=len(deltas),
         mean_delta=round(sum(deltas) / len(deltas), 2),
         mean_abs_bps=round(sum(abs_bps_vals) / len(abs_bps_vals), 2),
+        mean_signed_bps=round(sum(signed_bps_vals) / len(signed_bps_vals), 2),
         p95_abs_bps=round(compute_percentile(sorted_bps, 95.0), 2),
         max_abs_bps=round(sorted_bps[-1], 2),
         min_delta=round(min(deltas), 2),
@@ -243,10 +247,10 @@ def build_heatmap_slices(
         defaultdict(list) for _ in range(effective_slices)
     ]
     for tick in ticks:
-        if tick.source == "rest_backfill":
+        if tick.source == "rest_backfill" or tick.latency_ms < 0:
             continue
         idx = min(effective_slices - 1, max(0, (tick.ts_ms - min_ts) // step_ms))
-        slice_latencies[idx][tick.exchange].append(max(0.0, tick.latency_ms))
+        slice_latencies[idx][tick.exchange].append(tick.latency_ms)
 
     slice_usd_bps: list[list[float]] = [[] for _ in range(effective_slices)]
     slice_usdt_bps: list[list[float]] = [[] for _ in range(effective_slices)]

@@ -28,6 +28,15 @@ def compute_percentile(sorted_values: Sequence[float], pct: float) -> float:
     return float(sorted_values[low] * (1.0 - weight) + sorted_values[high] * weight)
 
 
+def _resolve_dedup_seq(tick: NormalizedTick) -> str:
+    """Resolve non-null deduplication discriminator for `UNIQUE(..., dedup_seq)`."""
+    if tick.dedup_seq is not None:
+        return tick.dedup_seq
+    if tick.sequence_id is not None:
+        return str(tick.sequence_id)
+    return ""
+
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS capture_runs (
     run_id TEXT PRIMARY KEY,
@@ -37,7 +46,9 @@ CREATE TABLE IF NOT EXISTS capture_runs (
     started_utc TEXT NOT NULL,
     ended_utc TEXT,
     exchanges TEXT NOT NULL,
-    notes TEXT NOT NULL DEFAULT ''
+    notes TEXT NOT NULL DEFAULT '',
+    raw_input_rows INTEGER NOT NULL DEFAULT 0,
+    deduplicated_rows INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS ticks (
@@ -54,13 +65,14 @@ CREATE TABLE IF NOT EXISTS ticks (
     size REAL,
     volume_24h REAL,
     sequence_id INTEGER,
+    dedup_seq TEXT NOT NULL DEFAULT '',
     ts_ms INTEGER NOT NULL,
     ts_utc TEXT NOT NULL,
     received_ms INTEGER NOT NULL,
     latency_ms REAL NOT NULL,
     source TEXT NOT NULL,
     FOREIGN KEY (run_id) REFERENCES capture_runs(run_id) ON DELETE CASCADE,
-    UNIQUE(exchange, symbol, ts_ms, source)
+    UNIQUE(run_id, exchange, symbol, ts_ms, source, dedup_seq)
 );
 
 CREATE INDEX IF NOT EXISTS idx_ticks_run_ts ON ticks(run_id, ts_ms);
@@ -126,7 +138,73 @@ class MarketStorage:
     def _init_schema(self) -> None:
         with self._lock:
             self._conn.executescript(SCHEMA_SQL)
+            self._migrate_schema_if_needed()
             self._conn.commit()
+
+    def _migrate_schema_if_needed(self) -> None:
+        run_cols = {
+            str(r["name"])
+            for r in self._conn.execute("PRAGMA table_info(capture_runs)").fetchall()
+        }
+        if "raw_input_rows" not in run_cols:
+            self._conn.execute(
+                "ALTER TABLE capture_runs ADD COLUMN raw_input_rows INTEGER NOT NULL DEFAULT 0"
+            )
+        if "deduplicated_rows" not in run_cols:
+            self._conn.execute(
+                "ALTER TABLE capture_runs ADD COLUMN deduplicated_rows INTEGER NOT NULL DEFAULT 0"
+            )
+
+        row = self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'ticks'"
+        ).fetchone()
+        table_sql = " ".join(str(row["sql"]).split()) if row is not None else ""
+        expected_unique = "UNIQUE(run_id, exchange, symbol, ts_ms, source, dedup_seq)"
+        if "dedup_seq" not in table_sql or expected_unique not in table_sql:
+            self._conn.execute("PRAGMA foreign_keys=OFF;")
+            self._conn.executescript(
+                """
+                CREATE TABLE ticks_migrated (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL,
+                    exchange TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    raw_symbol TEXT NOT NULL,
+                    base_currency TEXT NOT NULL,
+                    quote_currency TEXT NOT NULL,
+                    price REAL NOT NULL,
+                    bid REAL,
+                    ask REAL,
+                    size REAL,
+                    volume_24h REAL,
+                    sequence_id INTEGER,
+                    dedup_seq TEXT NOT NULL DEFAULT '',
+                    ts_ms INTEGER NOT NULL,
+                    ts_utc TEXT NOT NULL,
+                    received_ms INTEGER NOT NULL,
+                    latency_ms REAL NOT NULL,
+                    source TEXT NOT NULL,
+                    FOREIGN KEY (run_id) REFERENCES capture_runs(run_id) ON DELETE CASCADE,
+                    UNIQUE(run_id, exchange, symbol, ts_ms, source, dedup_seq)
+                );
+                INSERT OR IGNORE INTO ticks_migrated (
+                    id, run_id, exchange, symbol, raw_symbol, base_currency, quote_currency,
+                    price, bid, ask, size, volume_24h, sequence_id, dedup_seq,
+                    ts_ms, ts_utc, received_ms, latency_ms, source
+                )
+                SELECT
+                    id, run_id, exchange, symbol, raw_symbol, base_currency, quote_currency,
+                    price, bid, ask, size, volume_24h, sequence_id,
+                    CASE WHEN sequence_id IS NOT NULL THEN CAST(sequence_id AS TEXT) ELSE '' END,
+                    ts_ms, ts_utc, received_ms, latency_ms, source
+                FROM ticks;
+                DROP TABLE ticks;
+                ALTER TABLE ticks_migrated RENAME TO ticks;
+                CREATE INDEX IF NOT EXISTS idx_ticks_run_ts ON ticks(run_id, ts_ms);
+                CREATE INDEX IF NOT EXISTS idx_ticks_exchange_ts ON ticks(exchange, symbol, ts_ms);
+                """
+            )
+            self._conn.execute("PRAGMA foreign_keys=ON;")
 
     def close(self) -> None:
         """Flush WAL checkpoint best-effort and close the SQLite connection."""
@@ -147,8 +225,9 @@ class MarketStorage:
             self._conn.execute(
                 """
                 INSERT INTO capture_runs (
-                    run_id, mode, started_ms, ended_ms, started_utc, ended_utc, exchanges, notes
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    run_id, mode, started_ms, ended_ms, started_utc, ended_utc,
+                    exchanges, notes, raw_input_rows, deduplicated_rows
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(run_id) DO UPDATE SET
                     mode=excluded.mode,
                     started_ms=excluded.started_ms,
@@ -156,7 +235,9 @@ class MarketStorage:
                     started_utc=excluded.started_utc,
                     ended_utc=excluded.ended_utc,
                     exchanges=excluded.exchanges,
-                    notes=excluded.notes
+                    notes=excluded.notes,
+                    raw_input_rows=excluded.raw_input_rows,
+                    deduplicated_rows=excluded.deduplicated_rows
                 """,
                 (
                     run.run_id,
@@ -167,27 +248,42 @@ class MarketStorage:
                     run.ended_utc,
                     run.exchanges,
                     run.notes,
+                    run.raw_input_rows,
+                    run.deduplicated_rows,
                 ),
             )
             self._conn.commit()
 
-    def finish_run(self, run_id: str, ended_ms: int, ended_utc: str, notes: str = "") -> None:
-        """Record completion timestamp and optional summary notes for a capture run."""
+    def finish_run(
+        self,
+        run_id: str,
+        ended_ms: int,
+        ended_utc: str,
+        notes: str = "",
+        raw_input_rows: int | None = None,
+        deduplicated_rows: int | None = None,
+    ) -> None:
+        """Record completion timestamp and optional summary counters for a capture run."""
         with self._lock:
             self._conn.execute(
                 """
                 UPDATE capture_runs
                 SET ended_ms = ?,
                     ended_utc = ?,
-                    notes = CASE WHEN ? != '' THEN ? ELSE notes END
+                    notes = CASE WHEN ? != '' THEN ? ELSE notes END,
+                    raw_input_rows = COALESCE(?, raw_input_rows),
+                    deduplicated_rows = COALESCE(?, deduplicated_rows)
                 WHERE run_id = ?
                 """,
-                (ended_ms, ended_utc, notes, notes, run_id),
+                (ended_ms, ended_utc, notes, notes, raw_input_rows, deduplicated_rows, run_id),
             )
             self._conn.commit()
 
-    def upsert_ticks(self, run_id: str, ticks: Iterable[NormalizedTick]) -> int:
-        """Idempotently upsert ticks keyed by `(exchange, symbol, ts_ms, source)`."""
+    def insert_ticks(self, run_id: str, ticks: Iterable[NormalizedTick]) -> tuple[int, int]:
+        """Insert ticks idempotently using `INSERT OR IGNORE` scoped per `run_id`.
+
+        Returns `(inserted_count, duplicate_count)` measured via SQLite `total_changes`.
+        """
         rows = [
             (
                 run_id,
@@ -202,6 +298,7 @@ class MarketStorage:
                 t.size,
                 t.volume_24h,
                 t.sequence_id,
+                _resolve_dedup_seq(t),
                 t.ts_ms,
                 t.ts_utc,
                 t.received_ms,
@@ -211,30 +308,28 @@ class MarketStorage:
             for t in ticks
         ]
         if not rows:
-            return 0
+            return (0, 0)
         with self._lock:
+            before_changes = self._conn.total_changes
             self._conn.executemany(
                 """
-                INSERT INTO ticks (
+                INSERT OR IGNORE INTO ticks (
                     run_id, exchange, symbol, raw_symbol, base_currency, quote_currency,
-                    price, bid, ask, size, volume_24h, sequence_id,
+                    price, bid, ask, size, volume_24h, sequence_id, dedup_seq,
                     ts_ms, ts_utc, received_ms, latency_ms, source
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(exchange, symbol, ts_ms, source) DO UPDATE SET
-                    run_id=excluded.run_id,
-                    price=excluded.price,
-                    bid=COALESCE(excluded.bid, ticks.bid),
-                    ask=COALESCE(excluded.ask, ticks.ask),
-                    size=COALESCE(excluded.size, ticks.size),
-                    volume_24h=COALESCE(excluded.volume_24h, ticks.volume_24h),
-                    sequence_id=COALESCE(excluded.sequence_id, ticks.sequence_id),
-                    received_ms=MIN(ticks.received_ms, excluded.received_ms),
-                    latency_ms=MIN(ticks.latency_ms, excluded.latency_ms)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )
             self._conn.commit()
-        return len(rows)
+            inserted = self._conn.total_changes - before_changes
+        duplicates = len(rows) - inserted
+        return (inserted, duplicates)
+
+    def upsert_ticks(self, run_id: str, ticks: Iterable[NormalizedTick]) -> int:
+        """Backward-compatible wrapper returning newly inserted row count."""
+        inserted, _ = self.insert_ticks(run_id, ticks)
+        return inserted
 
     def insert_gap(self, gap: GapRecord) -> None:
         """Persist a detected gap and its backfill status."""
@@ -328,6 +423,8 @@ class MarketStorage:
             ended_utc=str(row["ended_utc"]) if row["ended_utc"] is not None else None,
             exchanges=str(row["exchanges"]),
             notes=str(row["notes"]),
+            raw_input_rows=int(row["raw_input_rows"]),
+            deduplicated_rows=int(row["deduplicated_rows"]),
         )
 
     def get_ticks(self, run_id: str) -> list[NormalizedTick]:
@@ -336,11 +433,11 @@ class MarketStorage:
             rows = self._conn.execute(
                 """
                 SELECT exchange, symbol, raw_symbol, base_currency, quote_currency,
-                       price, bid, ask, size, volume_24h, sequence_id,
+                       price, bid, ask, size, volume_24h, sequence_id, dedup_seq,
                        ts_ms, ts_utc, received_ms, latency_ms, source
                 FROM ticks
                 WHERE run_id = ?
-                ORDER BY ts_ms ASC, exchange ASC
+                ORDER BY ts_ms ASC, exchange ASC, id ASC
                 """,
                 (run_id,),
             ).fetchall()
@@ -362,6 +459,7 @@ class MarketStorage:
                 received_ms=int(r["received_ms"]),
                 latency_ms=float(r["latency_ms"]),
                 source=str(r["source"]),
+                dedup_seq=str(r["dedup_seq"]) or None,
             )
             for r in rows
         ]
@@ -432,7 +530,7 @@ class MarketStorage:
         run_id: str,
         include_sources: tuple[str, ...] = ("ws", "rest_poll", "fixture"),
     ) -> dict[str, dict[str, float]]:
-        """Return `count`, `p50`, `p95`, `max`, and `skewed_count` per exchange for live ticks."""
+        """Return latency percentiles over non-skewed (`>= 0`) samples plus raw/skewed counts."""
         placeholders = ",".join("?" for _ in include_sources)
         with self._lock:
             rows = self._conn.execute(
@@ -445,26 +543,33 @@ class MarketStorage:
                 (run_id, *include_sources),
             ).fetchall()
 
-        grouped: dict[str, list[float]] = defaultdict(list)
+        raw_grouped: dict[str, list[float]] = defaultdict(list)
+        non_skewed: dict[str, list[float]] = defaultdict(list)
         skewed: dict[str, int] = defaultdict(int)
         for row in rows:
             ex = str(row["exchange"])
             raw = float(row["latency_ms"])
+            raw_grouped[ex].append(raw)
             if raw < 0:
                 skewed[ex] += 1
-                grouped[ex].append(0.0)
             else:
-                grouped[ex].append(raw)
+                non_skewed[ex].append(raw)
 
         result: dict[str, dict[str, float]] = {}
-        for ex, vals in grouped.items():
-            vals.sort()
+        for ex, raw_vals in raw_grouped.items():
+            clean_vals = sorted(non_skewed.get(ex, []))
+            p50 = round(compute_percentile(clean_vals, 50.0), 2) if clean_vals else 0.0
+            p95 = round(compute_percentile(clean_vals, 95.0), 2) if clean_vals else 0.0
+            max_val = round(clean_vals[-1], 2) if clean_vals else 0.0
             result[ex] = {
-                "count": float(len(vals)),
-                "p50": round(compute_percentile(vals, 50.0), 2),
-                "p95": round(compute_percentile(vals, 95.0), 2),
-                "max": round(vals[-1], 2),
+                "count": float(len(raw_vals)),
+                "raw_count": float(len(raw_vals)),
+                "non_skewed_count": float(len(clean_vals)),
                 "skewed_count": float(skewed[ex]),
+                "p50": p50,
+                "p95": p95,
+                "max": max_val,
+                "raw_min": round(min(raw_vals), 2),
             }
         return result
 

@@ -107,6 +107,66 @@ def test_okx_ws_parsing_and_pong() -> None:
     assert ticks[0].latency_ms == pytest.approx(88.0)
 
 
+def test_same_ms_dedup_keys_across_coinbase_kraken_okx() -> None:
+    cb = CoinbaseAdapter()
+    cb_quote_only = {
+        "type": "ticker",
+        "sequence": 140056015570,
+        "product_id": "BTC-USD",
+        "price": "60729.6",
+        "best_bid": "60729.60",
+        "best_ask": "60729.65",
+        "time": "2026-11-23T02:14:21.398919Z",
+    }
+    cb_quote_next = {**cb_quote_only, "sequence": 140056015571, "best_ask": "60729.70"}
+    t_cb1 = cb.parse_ws_payload(cb_quote_only, received_ms=1795400061450)[0]
+    t_cb2 = cb.parse_ws_payload(cb_quote_next, received_ms=1795400061451)[0]
+    assert t_cb1.sequence_id is None  # does not mix global orderbook sequence into trade_id stream
+    assert t_cb1.dedup_seq != t_cb2.dedup_seq
+
+    kr = KrakenAdapter()
+    kr_item: dict[str, Any] = {
+        "symbol": "BTC/USD",
+        "bid": 60736.1,
+        "ask": 60736.2,
+        "last": 60732.7,
+        "volume": 3048.79,
+        "timestamp": "2026-11-23T02:14:21.503067Z",
+    }
+    kr_p1: dict[str, Any] = {"channel": "ticker", "data": [kr_item]}
+    kr_p2: dict[str, Any] = {"channel": "ticker", "data": [{**kr_item, "bid": 60736.3}]}
+    t_kr1 = kr.parse_ws_payload(kr_p1, received_ms=1795400061590)[0]
+    t_kr1_dup = kr.parse_ws_payload(kr_p1, received_ms=1795400061595)[0]
+    t_kr2 = kr.parse_ws_payload(kr_p2, received_ms=1795400061596)[0]
+    assert t_kr1.dedup_seq == t_kr1_dup.dedup_seq
+    assert t_kr1.dedup_seq != t_kr2.dedup_seq
+
+    okx = OKXAdapter()
+    okx_item: dict[str, Any] = {
+        "instId": "BTC-USDT",
+        "last": "60831.5",
+        "lastSz": "0.001",
+        "askPx": "60831.5",
+        "bidPx": "60831.4",
+        "vol24h": "8445.13",
+        "ts": "1795400061262",
+        "seqId": "9001",
+    }
+    okx_p1: dict[str, Any] = {
+        "arg": {"channel": "tickers", "instId": "BTC-USDT"},
+        "data": [okx_item],
+    }
+    okx_p2: dict[str, Any] = {
+        "arg": {"channel": "tickers", "instId": "BTC-USDT"},
+        "data": [{**okx_item, "seqId": "9002"}],
+    }
+    t_okx1 = okx.parse_ws_payload(okx_p1, received_ms=1795400061350)[0]
+    t_okx2 = okx.parse_ws_payload(okx_p2, received_ms=1795400061351)[0]
+    assert t_okx1.sequence_id == 9001
+    assert t_okx2.sequence_id == 9002
+    assert t_okx1.dedup_seq != t_okx2.dedup_seq
+
+
 @pytest.mark.asyncio
 async def test_rest_backfill_filters_window_and_handles_429(
     monkeypatch: pytest.MonkeyPatch,

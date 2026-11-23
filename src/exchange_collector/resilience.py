@@ -127,12 +127,15 @@ class GapDetector:
 
     def observe(self, tick: NormalizedTick) -> DetectedGap | None:
         """Inspect incoming tick against prior state; return DetectedGap when threshold trips."""
+        if tick.source == "rest_backfill":
+            return None
+
         key = (tick.exchange, tick.symbol)
         prev_ts = self._last_ts_ms.get(key)
         prev_seq = self._last_seq.get(key)
 
         detected: DetectedGap | None = None
-        # Only update watermarks monotonically so out-of-order backfill rows never regress state.
+        # Only update watermarks monotonically so out-of-order rows never regress state.
         if prev_ts is not None and tick.ts_ms - prev_ts > self.gap_threshold_ms:
             detected = DetectedGap(
                 exchange=tick.exchange,
@@ -144,7 +147,8 @@ class GapDetector:
                 curr_seq=tick.sequence_id,
             )
         elif (
-            prev_seq is not None
+            self.sequence_jump_threshold > 0
+            and prev_seq is not None
             and tick.sequence_id is not None
             and tick.sequence_id - prev_seq > self.sequence_jump_threshold
             and prev_ts is not None
@@ -198,6 +202,15 @@ class StaleFeedMonitor:
         key = (exchange, symbol)
         self._last_monotonic.setdefault(key, now)
         self._stale_active.setdefault(key, False)
+
+    def refresh_stream(
+        self, exchange: str, symbol: str, now_monotonic: float | None = None
+    ) -> None:
+        """Reset monotonic freshness timer for a freshly connected stream."""
+        now = time.monotonic() if now_monotonic is None else now_monotonic
+        key = (exchange, symbol)
+        self._last_monotonic[key] = now
+        self._stale_active[key] = False
 
     def record_activity(
         self,

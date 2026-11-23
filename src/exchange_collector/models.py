@@ -37,6 +37,7 @@ class NormalizedTick:
     received_ms: int
     latency_ms: float
     source: str
+    dedup_seq: str | None = None
 
     @property
     def mid_price(self) -> float:
@@ -100,3 +101,5 @@ class CaptureRun:
     ended_utc: str | None
     exchanges: str
     notes: str
+    raw_input_rows: int = 0
+    deduplicated_rows: int = 0

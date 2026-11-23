@@ -9,6 +9,7 @@ import logging
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
 
 import aiohttp
 
@@ -45,13 +46,22 @@ class CollectorConfig:
 
     stale_seconds: float = 8.0
     gap_threshold_ms: int = 5000
-    sequence_jump_threshold: int = 50
+    sequence_jump_threshold: int = 500
     http_timeout_seconds: float = 8.0
     ws_receive_timeout_seconds: float = 12.0
     rest_poll_interval_seconds: float = 2.0
     flush_interval_seconds: float = 0.5
     flush_batch_size: int = 40
     skew_alert_cooldown_seconds: float = 30.0
+
+
+@dataclass(slots=True)
+class _AdapterConnState:
+    """Mutable per-adapter reconnect and connection-health state."""
+
+    attempt: int = 0
+    last_disconnect_ms: int | None = None
+    confirmed_healthy: bool = False
 
 
 class FeedCollector:
@@ -80,6 +90,16 @@ class FeedCollector:
         self._buffer_lock = asyncio.Lock()
         self._last_skew_alert_mono: dict[str, float] = {}
         self._backfill_tasks: set[asyncio.Task[None]] = set()
+        self._stale_events: dict[str, asyncio.Event] = {
+            adapter.exchange: asyncio.Event() for adapter in self.adapters
+        }
+        self._ws_active: dict[str, bool] = {adapter.exchange: False for adapter in self.adapters}
+        self._raw_input_rows: int = 0
+        self._deduplicated_rows: int = 0
+
+    def _record_insert_stats(self, inserted: int, duplicates: int) -> None:
+        self._raw_input_rows += inserted + duplicates
+        self._deduplicated_rows += duplicates
 
     async def run(
         self,
@@ -91,6 +111,11 @@ class FeedCollector:
     ) -> str:
         """Execute market-data collection until `duration_seconds` elapses or `stop_event` fires."""
         external_stop = stop_event if stop_event is not None else asyncio.Event()
+        self._raw_input_rows = 0
+        self._deduplicated_rows = 0
+        for adapter in self.adapters:
+            self._stale_events[adapter.exchange].clear()
+            self._ws_active[adapter.exchange] = False
         started_ms = utc_now_ms()
         exchanges_str = ",".join(a.exchange for a in self.adapters)
         self.storage.start_run(
@@ -157,7 +182,13 @@ class FeedCollector:
 
         await self._flush_pending_ticks(run_id)
         ended_ms = utc_now_ms()
-        self.storage.finish_run(run_id, ended_ms, epoch_ms_to_utc_iso(ended_ms))
+        self.storage.finish_run(
+            run_id,
+            ended_ms,
+            epoch_ms_to_utc_iso(ended_ms),
+            raw_input_rows=self._raw_input_rows,
+            deduplicated_rows=self._deduplicated_rows,
+        )
         return run_id
 
     async def _run_adapter_loop(
@@ -170,14 +201,16 @@ class FeedCollector:
         stop: asyncio.Event,
     ) -> None:
         breaker = self.breakers[adapter.exchange]
-        attempt = 0
-        last_disconnect_ms: int | None = None
+        stale_event = self._stale_events[adapter.exchange]
+        conn_state = _AdapterConnState()
 
         while not stop.is_set():
             if not breaker.allow_request():
                 await self._poll_rest_fallback(run_id, adapter, session, proxy_url, stop)
                 continue
 
+            conn_state.confirmed_healthy = False
+            stale_event.clear()
             try:
                 async with session.ws_connect(
                     adapter.ws_url,
@@ -189,44 +222,29 @@ class FeedCollector:
                     ),
                 ) as ws:
                     await ws.send_json(adapter.ws_subscribe_payload())
-                    prev_state = breaker.current_state()
-                    new_state = breaker.record_success()
-                    attempt = 0
-
-                    if prev_state == CircuitState.HALF_OPEN and new_state == CircuitState.CLOSED:
-                        self._emit_alert(
-                            run_id=run_id,
-                            exchange=adapter.exchange,
-                            symbol=adapter.canonical_symbol,
-                            severity="info",
-                            alert_type="circuit_closed",
-                            message="WebSocket circuit breaker recovered to CLOSED",
-                            metric_value=None,
-                            threshold=None,
+                    self.stale_monitor.refresh_stream(adapter.exchange, adapter.canonical_symbol)
+                    self._ws_active[adapter.exchange] = True
+                    try:
+                        await self._consume_ws(
+                            run_id,
+                            adapter,
+                            ws,
+                            session,
+                            proxy_url,
+                            stop,
+                            breaker,
+                            conn_state,
+                            stale_event,
                         )
-
-                    if last_disconnect_ms is not None:
-                        reconnect_ms = utc_now_ms()
-                        gap = DetectedGap(
-                            exchange=adapter.exchange,
-                            symbol=adapter.canonical_symbol,
-                            gap_type="disconnect",
-                            start_ts_ms=last_disconnect_ms,
-                            end_ts_ms=reconnect_ms,
-                            prev_seq=None,
-                            curr_seq=None,
-                        )
-                        self._schedule_backfill(run_id, adapter, session, proxy_url, gap)
-                        last_disconnect_ms = None
-
-                    await self._consume_ws(run_id, adapter, ws, session, proxy_url, stop)
+                    finally:
+                        self._ws_active[adapter.exchange] = False
 
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 logger.warning("WS stream error for %s: %s", adapter.exchange, exc)
-                if last_disconnect_ms is None:
-                    last_disconnect_ms = utc_now_ms()
+                if conn_state.last_disconnect_ms is None:
+                    conn_state.last_disconnect_ms = utc_now_ms()
                 prev_state = breaker.current_state()
                 new_state = breaker.record_failure()
                 if prev_state != CircuitState.OPEN and new_state == CircuitState.OPEN:
@@ -240,11 +258,55 @@ class FeedCollector:
                         metric_value=float(breaker.failure_count),
                         threshold=float(breaker.failure_threshold),
                     )
-                delay = self.backoff.delay_for_attempt(attempt)
-                attempt += 1
+                delay = self.backoff.delay_for_attempt(conn_state.attempt)
+                conn_state.attempt += 1
                 await self._rest_fallback_once(run_id, adapter, session, proxy_url)
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(stop.wait(), timeout=delay)
+
+    async def _receive_ws_msg(
+        self,
+        adapter: ExchangeAdapter,
+        ws: aiohttp.ClientWebSocketResponse,
+        stale_event: asyncio.Event,
+        stop: asyncio.Event,
+    ) -> aiohttp.WSMessage | None:
+        recv_task: asyncio.Task[aiohttp.WSMessage] = asyncio.create_task(ws.receive())
+        stale_task: asyncio.Task[bool] = asyncio.create_task(stale_event.wait())
+        stop_task: asyncio.Task[bool] = asyncio.create_task(stop.wait())
+        all_tasks: set[asyncio.Task[Any]] = {recv_task, stale_task, stop_task}
+        try:
+            done, pending = await asyncio.wait(
+                all_tasks,
+                timeout=self.config.ws_receive_timeout_seconds,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+            if not done:
+                raise TimeoutError(
+                    f"{adapter.exchange} WS receive timed out after "
+                    f"{self.config.ws_receive_timeout_seconds:.1f}s"
+                )
+            if stop_task in done and stop.is_set():
+                if recv_task.done() and not recv_task.cancelled():
+                    _ = recv_task.exception()
+                return None
+            if stale_task in done and stale_event.is_set():
+                stale_event.clear()
+                if recv_task.done() and not recv_task.cancelled():
+                    _ = recv_task.exception()
+                raise ConnectionError(f"{adapter.exchange} WS stream silent past stale threshold")
+            return recv_task.result()
+        except asyncio.CancelledError:
+            for task in all_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*all_tasks, return_exceptions=True)
+            raise
 
     async def _consume_ws(
         self,
@@ -254,6 +316,9 @@ class FeedCollector:
         session: aiohttp.ClientSession,
         proxy_url: str | None,
         stop: asyncio.Event,
+        breaker: CircuitBreaker,
+        conn_state: _AdapterConnState,
+        stale_event: asyncio.Event,
     ) -> None:
         last_ping = time.monotonic()
         ping_payload = adapter.ws_ping_payload()
@@ -266,9 +331,9 @@ class FeedCollector:
                     await ws.send_json(ping_payload)
                 last_ping = time.monotonic()
 
-            msg = await asyncio.wait_for(
-                ws.receive(), timeout=self.config.ws_receive_timeout_seconds
-            )
+            msg = await self._receive_ws_msg(adapter, ws, stale_event, stop)
+            if msg is None:
+                return
             received_ms = utc_now_ms()
             if msg.type in {
                 aiohttp.WSMsgType.CLOSE,
@@ -301,8 +366,47 @@ class FeedCollector:
                 continue
 
             ticks = adapter.parse_ws_payload(payload, received_ms)
+            if not ticks:
+                continue
+
             for tick in ticks:
-                await self._ingest_tick(run_id, adapter, tick, session, proxy_url)
+                gap_emitted = await self._ingest_tick(run_id, adapter, tick, session, proxy_url)
+                if conn_state.last_disconnect_ms is not None:
+                    if not gap_emitted and tick.ts_ms > conn_state.last_disconnect_ms:
+                        self._schedule_backfill(
+                            run_id,
+                            adapter,
+                            session,
+                            proxy_url,
+                            DetectedGap(
+                                exchange=adapter.exchange,
+                                symbol=adapter.canonical_symbol,
+                                gap_type="disconnect",
+                                start_ts_ms=conn_state.last_disconnect_ms,
+                                end_ts_ms=tick.ts_ms,
+                                prev_seq=None,
+                                curr_seq=tick.sequence_id,
+                            ),
+                        )
+                    conn_state.last_disconnect_ms = None
+
+            if not conn_state.confirmed_healthy or breaker.current_state() != CircuitState.CLOSED:
+                await self._flush_pending_ticks(run_id)
+                conn_state.confirmed_healthy = True
+                conn_state.attempt = 0
+                prev_state = breaker.current_state()
+                new_state = breaker.record_success()
+                if prev_state == CircuitState.HALF_OPEN and new_state == CircuitState.CLOSED:
+                    self._emit_alert(
+                        run_id=run_id,
+                        exchange=adapter.exchange,
+                        symbol=adapter.canonical_symbol,
+                        severity="info",
+                        alert_type="circuit_closed",
+                        message="WebSocket circuit breaker recovered to CLOSED",
+                        metric_value=None,
+                        threshold=None,
+                    )
 
     async def _ingest_tick(
         self,
@@ -311,7 +415,7 @@ class FeedCollector:
         tick: NormalizedTick,
         session: aiohttp.ClientSession,
         proxy_url: str | None,
-    ) -> None:
+    ) -> bool:
         skew = self.stale_monitor.record_activity(
             tick.exchange, tick.symbol, tick.ts_ms, tick.received_ms
         )
@@ -345,6 +449,7 @@ class FeedCollector:
                 should_flush = True
         if should_flush:
             await self._flush_pending_ticks(run_id)
+        return gap is not None
 
     def _schedule_backfill(
         self,
@@ -365,11 +470,16 @@ class FeedCollector:
                     self.config.http_timeout_seconds,
                     proxy_url,
                 )
-                if ticks:
-                    backfilled_rows = self.storage.upsert_ticks(run_id, ticks)
-                    status = "recovered"
+                in_window = [
+                    t for t in ticks if gap.start_ts_ms <= t.ts_ms <= gap.end_ts_ms
+                ]
+                if not in_window:
+                    status = "no_overlap"
                 else:
-                    status = "partial"
+                    inserted, duplicates = self.storage.insert_ticks(run_id, in_window)
+                    self._record_insert_stats(inserted, duplicates)
+                    backfilled_rows = inserted
+                    status = "recovered" if inserted >= 1 else "unrecovered"
             except Exception as exc:
                 logger.warning("REST backfill failed for %s: %s", adapter.exchange, exc)
                 status = "failed"
@@ -439,9 +549,10 @@ class FeedCollector:
             logger.debug("REST fallback error for %s: %s", adapter.exchange, exc)
 
     async def _watchdog_loop(self, run_id: str, stop: asyncio.Event) -> None:
+        poll_interval = min(1.0, max(0.05, self.config.stale_seconds / 2.0))
         while not stop.is_set():
             with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(stop.wait(), timeout=1.0)
+                await asyncio.wait_for(stop.wait(), timeout=poll_interval)
             if stop.is_set():
                 break
             for adapter in self.adapters:
@@ -457,11 +568,14 @@ class FeedCollector:
                         alert_type="stale_feed",
                         message=(
                             f"Feed silent for {stale_elapsed:.2f}s "
-                            f"(monotonic threshold {self.config.stale_seconds:.1f}s)"
+                            f"(monotonic threshold {self.config.stale_seconds:.1f}s); "
+                            "triggering reconnect and REST fallback"
                         ),
                         metric_value=round(stale_elapsed, 2),
                         threshold=self.config.stale_seconds,
                     )
+                    if self._ws_active.get(adapter.exchange, False):
+                        self._stale_events[adapter.exchange].set()
 
     async def _flush_loop(self, run_id: str, stop: asyncio.Event) -> None:
         while not stop.is_set():
@@ -475,7 +589,8 @@ class FeedCollector:
                 return
             batch = self._tick_buffer[:]
             self._tick_buffer.clear()
-        self.storage.upsert_ticks(run_id, batch)
+        inserted, duplicates = self.storage.insert_ticks(run_id, batch)
+        self._record_insert_stats(inserted, duplicates)
 
     def _emit_alert(
         self,
