@@ -12,7 +12,7 @@ import pytest
 from aiohttp import web
 from PIL import Image
 
-from exchange_collector.adapters import ExchangeAdapter
+from exchange_collector.adapters import CoinbaseAdapter, ExchangeAdapter
 from exchange_collector.cli import build_parser, main, run_demo
 from exchange_collector.collector import CollectorConfig, FeedCollector
 from exchange_collector.models import NormalizedTick, epoch_ms_to_utc_iso
@@ -524,3 +524,260 @@ async def test_rest_backfill_strict_window_and_new_row_verification(tmp_path: Pa
         gaps = storage.get_gaps("bf_strict")
         assert [g.backfill_status for g in gaps] == ["no_overlap", "unrecovered", "recovered"]
         assert [g.backfilled_rows for g in gaps] == [0, 0, 1]
+
+
+class _LocalCoinbaseAdapter(CoinbaseAdapter):
+    def __init__(self, ws_url: str, rest_ticker_url: str) -> None:
+        super().__init__()
+        self.ws_url = ws_url
+        self.rest_ticker_url = rest_ticker_url
+
+
+@pytest.mark.asyncio
+async def test_zero_and_negative_price_ticks_rejected_without_persisting_or_resetting_breaker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state: dict[str, int] = {"ws_connections": 0, "rest_calls": 0}
+
+    async def ws_handler(request: web.Request) -> web.WebSocketResponse:
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        state["ws_connections"] += 1
+        async for msg in ws:
+            if msg.type != aiohttp.WSMsgType.TEXT:
+                continue
+            await ws.send_json(
+                {
+                    "type": "ticker",
+                    "product_id": "BTC-USD",
+                    "price": "0",
+                    "time": "2026-11-23T02:14:21.398919Z",
+                    "trade_id": 2001,
+                }
+            )
+            await ws.send_json(
+                {
+                    "type": "ticker",
+                    "product_id": "BTC-USD",
+                    "price": "-25.5",
+                    "time": "2026-11-23T02:14:21.450000Z",
+                    "trade_id": 2002,
+                }
+            )
+            await ws.send_json(
+                {
+                    "type": "ticker",
+                    "product_id": "BTC-USD",
+                    "price": "NaN",
+                    "time": "2026-11-23T02:14:21.500000Z",
+                    "trade_id": 2003,
+                }
+            )
+            await ws.close()
+            break
+        return ws
+
+    async def rest_ticker_handler(request: web.Request) -> web.Response:
+        state["rest_calls"] += 1
+        return web.json_response(
+            {
+                "price": "0",
+                "bid": "0",
+                "ask": "0",
+                "size": "0.01",
+                "volume": "100.0",
+                "time": "2026-11-23T02:14:21.600000Z",
+                "trade_id": 2004,
+            }
+        )
+
+    app = web.Application()
+    app.router.add_get("/ws", ws_handler)
+    app.router.add_get("/ticker", rest_ticker_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    assert runner.addresses
+    port = int(runner.addresses[0][1])
+
+    observed_attempts: list[int] = []
+    orig_delay = BackoffPolicy.delay_for_attempt
+
+    def spy_delay(self: BackoffPolicy, attempt: int, rng: Any = None) -> float:
+        observed_attempts.append(attempt)
+        return orig_delay(self, attempt, rng=rng)
+
+    monkeypatch.setattr(BackoffPolicy, "delay_for_attempt", spy_delay)
+
+    try:
+        db_path = tmp_path / "zero_price.db"
+        with MarketStorage(db_path) as storage:
+            adapter = _LocalCoinbaseAdapter(
+                f"http://127.0.0.1:{port}/ws",
+                f"http://127.0.0.1:{port}/ticker",
+            )
+            collector = FeedCollector(
+                storage,
+                adapters=[adapter],
+                config=CollectorConfig(
+                    stale_seconds=5.0,
+                    http_timeout_seconds=0.5,
+                    ws_receive_timeout_seconds=0.3,
+                    rest_poll_interval_seconds=0.05,
+                    flush_interval_seconds=0.05,
+                ),
+                backoff=BackoffPolicy(base_seconds=0.01, max_seconds=0.02, jitter_ratio=0.0),
+            )
+            breaker = CircuitBreaker(
+                name="coinbase",
+                failure_threshold=3,
+                recovery_timeout_seconds=0.12,
+                half_open_success_threshold=1,
+            )
+            breaker.record_failure()
+            collector.breakers["coinbase"] = breaker
+
+            stop_event = asyncio.Event()
+            task = asyncio.create_task(
+                collector.run(
+                    run_id="zero_price_probe",
+                    mode="live-sample",
+                    duration_seconds=3.0,
+                    stop_event=stop_event,
+                )
+            )
+            for _ in range(60):
+                if (
+                    state["ws_connections"] >= 3
+                    and breaker.current_state() == CircuitState.OPEN
+                    and state["rest_calls"] >= 1
+                ):
+                    break
+                await asyncio.sleep(0.02)
+            stop_event.set()
+            await task
+
+            assert state["ws_connections"] >= 2
+            assert state["rest_calls"] >= 1
+            assert storage.get_ticks("zero_price_probe") == []
+            assert breaker.failure_count >= 3
+            assert breaker.current_state() != CircuitState.CLOSED
+            assert observed_attempts[:2] == [0, 1]
+            alerts = storage.get_alerts("zero_price_probe")
+            assert any(a.alert_type == "circuit_open" for a in alerts)
+            assert not any(a.alert_type == "circuit_closed" for a in alerts)
+            assert not any(a.alert_type == "rest_fallback" for a in alerts)
+    finally:
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_only_ws_triggers_stale_event_connection_error_rest_fallback_and_reconnect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state: dict[str, int] = {"conn_count": 0, "heartbeats_sent": 0}
+
+    async def ws_handler(request: web.Request) -> web.WebSocketResponse:
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        state["conn_count"] += 1
+        conn_idx = state["conn_count"]
+        async for msg in ws:
+            if msg.type != aiohttp.WSMsgType.TEXT:
+                continue
+            if conn_idx == 1:
+                for _ in range(40):
+                    if ws.closed:
+                        break
+                    try:
+                        await ws.send_json({"type": "heartbeat"})
+                    except Exception:
+                        break
+                    state["heartbeats_sent"] += 1
+                    await asyncio.sleep(0.03)
+                break
+            await ws.send_json(
+                {
+                    "type": "tick",
+                    "price": 60755.0,
+                    "seq": 101,
+                    "ts_ms": 1_795_395_610_000,
+                }
+            )
+            await asyncio.sleep(0.5)
+            break
+        return ws
+
+    app = web.Application()
+    app.router.add_get("/ws", ws_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    assert runner.addresses
+    port = int(runner.addresses[0][1])
+
+    try:
+        db_path = tmp_path / "heartbeat_stale.db"
+        with MarketStorage(db_path) as storage:
+            adapter = _LocalWSAdapter(f"http://127.0.0.1:{port}/ws")
+            collector = FeedCollector(
+                storage,
+                adapters=[adapter],
+                config=CollectorConfig(
+                    stale_seconds=0.15,
+                    http_timeout_seconds=0.3,
+                    ws_receive_timeout_seconds=5.0,
+                    rest_poll_interval_seconds=0.1,
+                    flush_interval_seconds=0.05,
+                ),
+                backoff=BackoffPolicy(base_seconds=0.02, max_seconds=0.04, jitter_ratio=0.0),
+            )
+
+            stale_errors: list[BaseException] = []
+            orig_receive = collector._receive_ws_msg
+
+            async def spy_receive(*args: Any, **kwargs: Any) -> aiohttp.WSMessage | None:
+                try:
+                    return await orig_receive(*args, **kwargs)
+                except ConnectionError as exc:
+                    stale_errors.append(exc)
+                    raise
+
+            monkeypatch.setattr(collector, "_receive_ws_msg", spy_receive)
+
+            stop_event = asyncio.Event()
+            task = asyncio.create_task(
+                collector.run(
+                    run_id="hb_stale_test",
+                    mode="live-sample",
+                    duration_seconds=3.0,
+                    stop_event=stop_event,
+                )
+            )
+            for _ in range(80):
+                counts = storage.get_exchange_counts("hb_stale_test")
+                cb_counts = counts.get("coinbase", {})
+                if cb_counts.get("rest_poll", 0) >= 1 and cb_counts.get("ws", 0) >= 1:
+                    break
+                await asyncio.sleep(0.03)
+            stop_event.set()
+            await task
+
+            alerts = storage.get_alerts("hb_stale_test")
+            counts = storage.get_exchange_counts("hb_stale_test")
+            assert state["heartbeats_sent"] >= 3
+            assert any(
+                isinstance(err, ConnectionError) and "stale threshold" in str(err)
+                for err in stale_errors
+            )
+            assert any(a.alert_type == "stale_feed" for a in alerts)
+            assert any(a.alert_type == "rest_fallback" for a in alerts)
+            assert counts["coinbase"]["rest_poll"] >= 1
+            assert state["conn_count"] >= 2
+            assert counts["coinbase"]["ws"] >= 1
+    finally:
+        await runner.cleanup()

@@ -24,11 +24,11 @@ For a single-node market-data collector monitoring public L1 pairs on one host (
 
 Key design choices:
 
-- **Health verified by persisted ticks, not handshake**: `CircuitBreaker.record_success()` and backoff reset run only after at least one valid parsed market tick has been received and flushed to SQLite, preventing premature `HALF_OPEN -> CLOSED` transitions when a socket accepts subscribe frames and immediately hangs.
+- **Health verified by valid persisted ticks, not handshakes or heartbeats**: `NormalizedTick` and all WS/REST adapters reject non-positive or non-finite prices (`price <= 0`, `NaN`, `inf`). `CircuitBreaker.record_success()` and backoff reset run only after at least one valid parsed market tick has been persisted to SQLite.
 - **Active stale-silence preemption**: `StaleFeedMonitor.check_stale()` feeds an async wake-up event that tears down silent WebSockets and immediately triggers REST fallback + reconnect instead of merely logging alerts.
 - **Strict backfill verification**: `_schedule_backfill()` spawns a tracked background task, filters REST trades strictly to `[gap_start_ms, gap_end_ms]`, and marks a gap `recovered` only when `>= 1` genuinely new row is inserted (otherwise `no_overlap` or `unrecovered`).
 - **Monotonic watermarks & non-mixed sequences**: Out-of-order `rest_backfill` rows bypass advancing `_last_ts_ms` / `_last_seq`, and Coinbase `trade_id` is kept separate from global book `sequence` in `GapDetector`.
-- **Application heartbeats count as liveness**: Kraken v2 sends `{"channel": "heartbeat"}` and OKX replies `"pong"`; both refresh `StaleFeedMonitor` without injecting synthetic prices.
+- **Heartbeats tracked separately from market liveness**: Kraken v2 `{"channel": "heartbeat"}`, Coinbase `"heartbeat"`, and OKX `"pong"` call `StaleFeedMonitor.record_control()` without resetting the market-tick stale timer, so a heartbeat-only stream with no valid `price > 0` ticks still triggers stale reconnect and REST fallback.
 
 ## 3. Spread Bucket Alignment & Explicit Quote Separation
 

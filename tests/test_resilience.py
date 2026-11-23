@@ -117,6 +117,27 @@ def test_stale_feed_monitor_monotonic_and_clock_skew() -> None:
     assert monitor.check_stale("coinbase", "BTC-USD", now_monotonic=110.0) is None
 
 
+def test_stale_feed_monitor_control_frames_do_not_refresh_liveness() -> None:
+    monitor = StaleFeedMonitor(stale_seconds=5.0)
+    monitor.register_stream("coinbase", "BTC-USD", now_monotonic=100.0)
+
+    # Repeated heartbeats/controls must NOT reset the market-tick stale timer.
+    monitor.record_control("coinbase", "BTC-USD", now_monotonic=103.0)
+    monitor.record_control("coinbase", "BTC-USD", now_monotonic=104.5)
+    elapsed = monitor.check_stale("coinbase", "BTC-USD", now_monotonic=105.5)
+    assert elapsed is not None and elapsed >= 5.0
+
+    # A valid market tick resets freshness and clears stale state.
+    monitor.record_market_tick(
+        "coinbase",
+        "BTC-USD",
+        event_ts_ms=1_700_000_006_000,
+        received_ms=1_700_000_006_020,
+        now_monotonic=106.0,
+    )
+    assert monitor.check_stale("coinbase", "BTC-USD", now_monotonic=109.0) is None
+
+
 def test_gap_detector_timestamp_sequence_and_out_of_order_watermarks() -> None:
     detector = GapDetector(gap_threshold_ms=5000, sequence_jump_threshold=10)
     base = 1_795_395_600_000

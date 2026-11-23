@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -347,9 +348,7 @@ class FeedCollector:
 
             text = msg.data
             if adapter.is_heartbeat_or_control(text):
-                self.stale_monitor.record_activity(
-                    adapter.exchange, adapter.canonical_symbol, received_ms, received_ms
-                )
+                self.stale_monitor.record_control(adapter.exchange, adapter.canonical_symbol)
                 continue
 
             try:
@@ -360,12 +359,15 @@ class FeedCollector:
             if not isinstance(payload, dict):
                 continue
             if adapter.is_heartbeat_or_control(payload):
-                self.stale_monitor.record_activity(
-                    adapter.exchange, adapter.canonical_symbol, received_ms, received_ms
-                )
+                self.stale_monitor.record_control(adapter.exchange, adapter.canonical_symbol)
                 continue
 
-            ticks = adapter.parse_ws_payload(payload, received_ms)
+            try:
+                parsed_ticks = adapter.parse_ws_payload(payload, received_ms)
+            except (KeyError, TypeError, ValueError) as exc:
+                logger.warning("Rejected malformed WS payload for %s: %s", adapter.exchange, exc)
+                continue
+            ticks = [t for t in parsed_ticks if math.isfinite(t.price) and t.price > 0.0]
             if not ticks:
                 continue
 
@@ -416,7 +418,7 @@ class FeedCollector:
         session: aiohttp.ClientSession,
         proxy_url: str | None,
     ) -> bool:
-        skew = self.stale_monitor.record_activity(
+        skew = self.stale_monitor.record_market_tick(
             tick.exchange, tick.symbol, tick.ts_ms, tick.received_ms
         )
         if skew.is_skewed:
@@ -527,10 +529,10 @@ class FeedCollector:
             tick = await adapter.fetch_rest_ticker(
                 session, self.config.http_timeout_seconds, proxy_url
             )
-            if tick is not None:
+            if tick is not None and math.isfinite(tick.price) and tick.price > 0.0:
                 async with self._buffer_lock:
                     self._tick_buffer.append(tick)
-                self.stale_monitor.record_activity(
+                self.stale_monitor.record_market_tick(
                     tick.exchange, tick.symbol, tick.ts_ms, tick.received_ms
                 )
                 self._emit_alert(

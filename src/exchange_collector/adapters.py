@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import urllib.parse
 import urllib.request
@@ -83,9 +84,21 @@ def normalize_symbol(exchange: str, raw_symbol: str) -> tuple[str, str, str]:
 
 
 def _to_optional_float(value: Any) -> float | None:
-    if value is None or value == "":
+    if value is None or value == "" or isinstance(value, bool):
         return None
-    return float(value)
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _parse_valid_price(value: Any) -> float | None:
+    """Parse a finite strictly positive price, returning None for invalid/non-positive values."""
+    parsed = _to_optional_float(value)
+    if parsed is None or parsed <= 0.0:
+        return None
+    return parsed
 
 
 def _to_optional_int(value: Any) -> int | None:
@@ -235,10 +248,12 @@ class CoinbaseAdapter(ExchangeAdapter):
     def parse_ws_payload(self, payload: dict[str, Any], received_ms: int) -> list[NormalizedTick]:
         if payload.get("type") != "ticker":
             return []
+        price = _parse_valid_price(payload.get("price"))
+        if price is None:
+            return []
         raw_time = payload.get("time")
         ts_ms = parse_iso_to_ms(str(raw_time)) if raw_time else received_ms
         raw_sym = str(payload.get("product_id", self.raw_symbol))
-        price = float(payload["price"])
         bid = _to_optional_float(payload.get("best_bid"))
         ask = _to_optional_float(payload.get("best_ask"))
         size = _to_optional_float(payload.get("last_size"))
@@ -279,10 +294,12 @@ class CoinbaseAdapter(ExchangeAdapter):
     ) -> NormalizedTick | None:
         data = await self._get_json(session, self.rest_ticker_url, timeout_seconds, proxy_url)
         received_ms = utc_now_ms()
-        if not isinstance(data, dict) or "price" not in data:
+        if not isinstance(data, dict):
+            return None
+        price = _parse_valid_price(data.get("price"))
+        if price is None:
             return None
         ts_ms = parse_iso_to_ms(str(data["time"])) if data.get("time") else received_ms
-        price = float(data["price"])
         bid = _to_optional_float(data.get("bid"))
         ask = _to_optional_float(data.get("ask"))
         size = _to_optional_float(data.get("size"))
@@ -322,12 +339,14 @@ class CoinbaseAdapter(ExchangeAdapter):
             return []
         ticks: list[NormalizedTick] = []
         for item in data:
-            if not isinstance(item, dict) or "price" not in item or "time" not in item:
+            if not isinstance(item, dict) or "time" not in item:
+                continue
+            price = _parse_valid_price(item.get("price"))
+            if price is None:
                 continue
             ts_ms = parse_iso_to_ms(str(item["time"]))
             if ts_ms < start_ts_ms or ts_ms > end_ts_ms:
                 continue
-            price = float(item["price"])
             size = _to_optional_float(item.get("size"))
             trade_id = _to_optional_int(item.get("trade_id"))
             dedup_seq = (
@@ -393,12 +412,14 @@ class KrakenAdapter(ExchangeAdapter):
             return []
         ticks: list[NormalizedTick] = []
         for item in items:
-            if not isinstance(item, dict) or "last" not in item:
+            if not isinstance(item, dict):
+                continue
+            price = _parse_valid_price(item.get("last"))
+            if price is None:
                 continue
             raw_ts = item.get("timestamp")
             ts_ms = parse_iso_to_ms(str(raw_ts)) if raw_ts else received_ms
             raw_sym = str(item.get("symbol", self.raw_symbol))
-            price = float(item["last"])
             bid = _to_optional_float(item.get("bid"))
             ask = _to_optional_float(item.get("ask"))
             vol = _to_optional_float(item.get("volume"))
@@ -446,7 +467,9 @@ class KrakenAdapter(ExchangeAdapter):
         vol_list = ticker.get("v") or []
         if not close_list:
             return None
-        price = float(close_list[0])
+        price = _parse_valid_price(close_list[0])
+        if price is None:
+            return None
         bid = _to_optional_float(bid_list[0]) if bid_list else None
         ask = _to_optional_float(ask_list[0]) if ask_list else None
         size = _to_optional_float(close_list[1]) if len(close_list) > 1 else None
@@ -489,11 +512,13 @@ class KrakenAdapter(ExchangeAdapter):
             for entry in entries:
                 if not isinstance(entry, list) or len(entry) < 3:
                     continue
+                price = _parse_valid_price(entry[0])
+                if price is None:
+                    continue
                 ts_ms = int(float(entry[2]) * 1000)
                 if ts_ms < start_ts_ms or ts_ms > end_ts_ms:
                     continue
                 seq = _to_optional_int(entry[6]) if len(entry) > 6 else None
-                price = float(entry[0])
                 size = _to_optional_float(entry[1])
                 dedup_seq = (
                     str(seq)
@@ -560,11 +585,13 @@ class OKXAdapter(ExchangeAdapter):
             return []
         ticks: list[NormalizedTick] = []
         for item in items:
-            if not isinstance(item, dict) or "last" not in item:
+            if not isinstance(item, dict):
+                continue
+            price = _parse_valid_price(item.get("last"))
+            if price is None:
                 continue
             ts_ms = int(item["ts"]) if item.get("ts") else received_ms
             raw_sym = str(item.get("instId", self.raw_symbol))
-            price = float(item["last"])
             bid = _to_optional_float(item.get("bidPx"))
             ask = _to_optional_float(item.get("askPx"))
             size = _to_optional_float(item.get("lastSz"))
@@ -605,11 +632,13 @@ class OKXAdapter(ExchangeAdapter):
         if not isinstance(items, list) or not items:
             return None
         item = items[0]
-        if not isinstance(item, dict) or "last" not in item:
+        if not isinstance(item, dict):
+            return None
+        price = _parse_valid_price(item.get("last"))
+        if price is None:
             return None
         ts_ms = int(item["ts"]) if item.get("ts") else received_ms
         raw_sym = str(item.get("instId", self.raw_symbol))
-        price = float(item["last"])
         bid = _to_optional_float(item.get("bidPx"))
         ask = _to_optional_float(item.get("askPx"))
         size = _to_optional_float(item.get("lastSz"))
@@ -650,13 +679,15 @@ class OKXAdapter(ExchangeAdapter):
             return []
         ticks: list[NormalizedTick] = []
         for item in items:
-            if not isinstance(item, dict) or "px" not in item or "ts" not in item:
+            if not isinstance(item, dict) or "ts" not in item:
+                continue
+            price = _parse_valid_price(item.get("px"))
+            if price is None:
                 continue
             ts_ms = int(item["ts"])
             if ts_ms < start_ts_ms or ts_ms > end_ts_ms:
                 continue
             raw_sym = str(item.get("instId", self.raw_symbol))
-            price = float(item["px"])
             size = _to_optional_float(item.get("sz"))
             trade_id = _to_optional_int(item.get("tradeId"))
             dedup_seq = (

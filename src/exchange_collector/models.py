@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -38,6 +39,11 @@ class NormalizedTick:
     latency_ms: float
     source: str
     dedup_seq: str | None = None
+
+    def __post_init__(self) -> None:
+        """Enforce finite strictly positive price on all normalized market ticks."""
+        if isinstance(self.price, bool) or not math.isfinite(self.price) or self.price <= 0.0:
+            raise ValueError(f"NormalizedTick price must be finite and > 0, got {self.price!r}")
 
     @property
     def mid_price(self) -> float:

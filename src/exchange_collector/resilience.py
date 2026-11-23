@@ -187,17 +187,18 @@ class SkewObservation:
 
 @dataclass(slots=True)
 class StaleFeedMonitor:
-    """Monotonic-clock feed freshness monitor immune to NTP/exchange wall-clock skew."""
+    """Monotonic-clock market-tick freshness monitor immune to NTP/exchange wall-clock skew."""
 
     stale_seconds: float = 8.0
     skew_tolerance_ms: int = 1500
     _last_monotonic: dict[tuple[str, str], float] = field(default_factory=dict, init=False)
+    _last_control_monotonic: dict[tuple[str, str], float] = field(default_factory=dict, init=False)
     _stale_active: dict[tuple[str, str], bool] = field(default_factory=dict, init=False)
 
     def register_stream(
         self, exchange: str, symbol: str, now_monotonic: float | None = None
     ) -> None:
-        """Start tracking freshness for a feed from subscription time."""
+        """Start tracking market-tick freshness for a feed from subscription time."""
         now = time.monotonic() if now_monotonic is None else now_monotonic
         key = (exchange, symbol)
         self._last_monotonic.setdefault(key, now)
@@ -212,7 +213,14 @@ class StaleFeedMonitor:
         self._last_monotonic[key] = now
         self._stale_active[key] = False
 
-    def record_activity(
+    def record_control(
+        self, exchange: str, symbol: str, now_monotonic: float | None = None
+    ) -> None:
+        """Record a heartbeat/control frame without refreshing market-tick liveness."""
+        now = time.monotonic() if now_monotonic is None else now_monotonic
+        self._last_control_monotonic[(exchange, symbol)] = now
+
+    def record_market_tick(
         self,
         exchange: str,
         symbol: str,
@@ -220,7 +228,7 @@ class StaleFeedMonitor:
         received_ms: int,
         now_monotonic: float | None = None,
     ) -> SkewObservation:
-        """Mark feed alive using monotonic clock and evaluate wall-clock skew."""
+        """Mark feed alive on a valid market tick and evaluate wall-clock skew."""
         now = time.monotonic() if now_monotonic is None else now_monotonic
         key = (exchange, symbol)
         self._last_monotonic[key] = now
@@ -231,6 +239,23 @@ class StaleFeedMonitor:
         if ahead_ms > self.skew_tolerance_ms:
             return SkewObservation(is_skewed=True, skew_ms=ahead_ms)
         return SkewObservation(is_skewed=False, skew_ms=ahead_ms)
+
+    def record_activity(
+        self,
+        exchange: str,
+        symbol: str,
+        event_ts_ms: int,
+        received_ms: int,
+        now_monotonic: float | None = None,
+    ) -> SkewObservation:
+        """Backward-compatible alias for `record_market_tick`."""
+        return self.record_market_tick(
+            exchange=exchange,
+            symbol=symbol,
+            event_ts_ms=event_ts_ms,
+            received_ms=received_ms,
+            now_monotonic=now_monotonic,
+        )
 
     def check_stale(
         self, exchange: str, symbol: str, now_monotonic: float | None = None

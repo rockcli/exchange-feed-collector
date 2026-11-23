@@ -11,9 +11,11 @@ from exchange_collector.adapters import (
     ExchangeRateLimitError,
     KrakenAdapter,
     OKXAdapter,
+    build_tick,
     normalize_symbol,
     parse_iso_to_ms,
 )
+from exchange_collector.models import NormalizedTick, epoch_ms_to_utc_iso
 
 
 def test_normalize_symbol_explicit_quotes() -> None:
@@ -209,3 +211,147 @@ async def test_rest_backfill_filters_window_and_handles_429(
     monkeypatch.setattr(adapter, "_get_json", raise_429)
     with pytest.raises(ExchangeRateLimitError):
         await adapter.fetch_rest_ticker(None, 5.0)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "bad_price",
+    [0.0, -0.01, -60000.0, float("nan"), float("inf"), float("-inf")],
+)
+def test_normalized_tick_and_build_tick_reject_non_positive_or_non_finite_price(
+    bad_price: float,
+) -> None:
+    ts_ms = 1_795_400_061_350
+    with pytest.raises(ValueError, match="price"):
+        NormalizedTick(
+            exchange="coinbase",
+            symbol="BTC-USD",
+            raw_symbol="BTC-USD",
+            base_currency="BTC",
+            quote_currency="USD",
+            price=bad_price,
+            bid=None,
+            ask=None,
+            size=None,
+            volume_24h=None,
+            sequence_id=1,
+            ts_ms=ts_ms,
+            ts_utc=epoch_ms_to_utc_iso(ts_ms),
+            received_ms=ts_ms + 10,
+            latency_ms=10.0,
+            source="ws",
+        )
+    with pytest.raises(ValueError, match="price"):
+        build_tick(
+            exchange="coinbase",
+            raw_symbol="BTC-USD",
+            price=bad_price,
+            bid=None,
+            ask=None,
+            size=None,
+            volume_24h=None,
+            sequence_id=1,
+            ts_ms=ts_ms,
+            received_ms=ts_ms + 10,
+            source="ws",
+        )
+
+
+@pytest.mark.parametrize("bad_price", ["0", "0.0", "-10.5", "NaN", "inf", "-inf", "", None])
+def test_ws_adapters_reject_non_positive_and_non_finite_prices(bad_price: Any) -> None:
+    cb = CoinbaseAdapter()
+    assert (
+        cb.parse_ws_payload(
+            {
+                "type": "ticker",
+                "product_id": "BTC-USD",
+                "price": bad_price,
+                "time": "2026-11-23T02:14:21.398919Z",
+                "trade_id": 100,
+            },
+            received_ms=1_795_400_061_450,
+        )
+        == []
+    )
+
+    kr = KrakenAdapter()
+    assert (
+        kr.parse_ws_payload(
+            {
+                "channel": "ticker",
+                "data": [
+                    {
+                        "symbol": "BTC/USD",
+                        "last": bad_price,
+                        "timestamp": "2026-11-23T02:14:21.503067Z",
+                    }
+                ],
+            },
+            received_ms=1_795_400_061_590,
+        )
+        == []
+    )
+
+    okx = OKXAdapter()
+    assert (
+        okx.parse_ws_payload(
+            {
+                "arg": {"channel": "tickers", "instId": "BTC-USDT"},
+                "data": [
+                    {
+                        "instId": "BTC-USDT",
+                        "last": bad_price,
+                        "ts": "1795400061262",
+                    }
+                ],
+            },
+            received_ms=1_795_400_061_350,
+        )
+        == []
+    )
+
+
+@pytest.mark.asyncio
+async def test_rest_ticker_and_backfill_reject_non_positive_prices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cb = CoinbaseAdapter()
+
+    async def fake_cb_ticker(*_: Any, **__: Any) -> dict[str, Any]:
+        return {"price": "0", "time": "2026-11-23T01:00:05.000Z", "trade_id": 1}
+
+    monkeypatch.setattr(cb, "_get_json", fake_cb_ticker)
+    assert await cb.fetch_rest_ticker(None, 5.0) is None  # type: ignore[arg-type]
+
+    async def fake_cb_trades(*_: Any, **__: Any) -> list[dict[str, Any]]:
+        return [
+            {"trade_id": 10, "price": "0", "size": "0.01", "time": "2026-11-23T01:00:05.000Z"},
+            {"trade_id": 11, "price": "-5.0", "size": "0.01", "time": "2026-11-23T01:00:06.000Z"},
+            {
+                "trade_id": 12,
+                "price": "60705.0",
+                "size": "0.02",
+                "time": "2026-11-23T01:00:07.000Z",
+            },
+        ]
+
+    monkeypatch.setattr(cb, "_get_json", fake_cb_trades)
+    start_ms = parse_iso_to_ms("2026-11-23T01:00:00.000Z")
+    end_ms = parse_iso_to_ms("2026-11-23T01:00:10.000Z")
+    cb_bf = await cb.fetch_rest_backfill(None, start_ms, end_ms, 5.0)  # type: ignore[arg-type]
+    assert [t.sequence_id for t in cb_bf] == [12]
+
+    kr = KrakenAdapter()
+
+    async def fake_kr_ticker(*_: Any, **__: Any) -> dict[str, Any]:
+        return {"result": {"XXBTZUSD": {"c": ["0", "0.1"], "b": ["0"], "a": ["0"]}}}
+
+    monkeypatch.setattr(kr, "_get_json", fake_kr_ticker)
+    assert await kr.fetch_rest_ticker(None, 5.0) is None  # type: ignore[arg-type]
+
+    okx = OKXAdapter()
+
+    async def fake_okx_ticker(*_: Any, **__: Any) -> dict[str, Any]:
+        return {"data": [{"instId": "BTC-USDT", "last": "-1.0", "ts": "1795400061262"}]}
+
+    monkeypatch.setattr(okx, "_get_json", fake_okx_ticker)
+    assert await okx.fetch_rest_ticker(None, 5.0) is None  # type: ignore[arg-type]
